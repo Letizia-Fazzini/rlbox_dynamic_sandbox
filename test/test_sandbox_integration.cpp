@@ -310,21 +310,25 @@ TEST_CASE("callback registration uses a trampoline slot and can unregister",
   s.impl_destroy_sandbox();
 }
 
-TEST_CASE("callback pool is bounded at 16 slots",
+// Mirrors the shim's RLBOX_CALLBACK_SLOTS default — kept in sync manually
+// since the host doesn't know the shim's compile-time slot count.
+static constexpr int kCallbackSlotsForTest = 64;
+
+TEST_CASE("callback pool fills exactly its slot count, then refuses more",
           "[sandbox][callback][limits]")
 {
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
   std::vector<void*> keys;
-  for (int i = 0; i < 16; ++i) {
+  for (int i = 0; i < kCallbackSlotsForTest; ++i) {
     auto* k = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1000 + i));
     auto tramp = s.impl_register_callback<int64_t, int64_t>(k, k);
     CHECK(tramp != 0);
     keys.push_back(k);
   }
 
-  // 17th registration must fail (return 0) — pool is full.
+  // One past the pool size must fail (return 0) — pool is full.
   auto* overflow_key = reinterpret_cast<void*>(0x2000ull);
   auto overflow = s.impl_register_callback<int64_t, int64_t>(overflow_key,
                                                              overflow_key);
