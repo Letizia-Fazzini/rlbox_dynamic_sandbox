@@ -32,7 +32,17 @@ from typing import Optional
 
 BENCH_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BENCH_DIR.parent
-DEFAULT_BUILD_DIR = REPO_ROOT / "test" / "zlib-testing" / "build"
+ZLIB_TESTING_DIR = REPO_ROOT / "test" / "zlib-testing"
+DEFAULT_BUILD_DIR = ZLIB_TESTING_DIR / "build"
+
+# Process-backend variants we'll drive when --process-builds is left at the
+# default.  Each entry is (label, build-subdir-name); the build dir defaults
+# to test/zlib-testing/<subdir>.  Adding a new transport is one line here +
+# a corresponding cmake build dir.
+DEFAULT_PROCESS_BUILDS = [
+    ("process_rpclib", "build_rpclib"),
+    ("process_capnp", "build_capnp"),
+]
 
 SANDBOX_RE = re.compile(r"SANDBOX_MS=([\d.]+)")
 NATIVE_RE = re.compile(r"NATIVE_MS=([\d.]+)")
@@ -128,10 +138,37 @@ def run_config(
     return rows
 
 
+def parse_process_builds(s: Optional[str]) -> list[tuple[str, Path]]:
+    """Parse a comma-separated list of label:path entries.  An entry without
+    a colon is treated as `process_<label>:<zlib-testing>/<label>`.
+    """
+    if not s:
+        return [
+            (label, ZLIB_TESTING_DIR / subdir)
+            for (label, subdir) in DEFAULT_PROCESS_BUILDS
+        ]
+    out: list[tuple[str, Path]] = []
+    for chunk in s.split(","):
+        c = chunk.strip()
+        if not c:
+            continue
+        if ":" in c:
+            label, path = c.split(":", 1)
+            out.append((label.strip(), Path(path.strip()).resolve()))
+        else:
+            out.append((f"process_{c}", (ZLIB_TESTING_DIR / c).resolve()))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--build-dir", type=Path, default=DEFAULT_BUILD_DIR,
-                    help="zlib-testing build directory (default: %(default)s)")
+    ap.add_argument("--wasm2c-build-dir", type=Path, default=DEFAULT_BUILD_DIR,
+                    help="build dir holding the wasm2c `main` binary "
+                         "(default: %(default)s)")
+    ap.add_argument("--process-builds", type=str, default=None,
+                    help="comma-separated process variants to drive, "
+                         "either `label:path` or `subdir` (resolved under "
+                         "test/zlib-testing).  Default: rpclib + capnp.")
     ap.add_argument("--sizes", type=str, default="256k,1m,4m,16m",
                     help="input sizes, comma-separated; k/m suffixes ok")
     ap.add_argument("--levels", type=str, default="1,6,9",
@@ -142,52 +179,81 @@ def main() -> int:
     ap.add_argument("--no-wasm2c", action="store_true",
                     help="skip the wasm2c backend (e.g. if not built)")
     ap.add_argument("--no-process", action="store_true",
-                    help="skip the process backend")
+                    help="skip the process backends entirely")
     args = ap.parse_args()
 
-    build_dir = args.build_dir.resolve()
+    wasm2c_build_dir = args.wasm2c_build_dir.resolve()
     sizes = parse_sizes(args.sizes)
     levels = parse_ints(args.levels)
 
-    main_bin = build_dir / "main"
-    main_process_bin = build_dir / "main_process"
-    pi_txt = build_dir / "pi.txt"
-    shim = build_dir / "sandbox_shim.so"
-
+    main_bin = wasm2c_build_dir / "main"
     if not args.no_wasm2c and not main_bin.exists():
-        print(f"[bench] {main_bin} missing; pass --no-wasm2c or rebuild", file=sys.stderr)
+        print(f"[bench] {main_bin} missing; pass --no-wasm2c or rebuild",
+              file=sys.stderr)
         return 1
+    # Native + wasm2c read pi.txt from the wasm2c build dir; we still need
+    # *some* seed file even when wasm2c is skipped, so fall back to whichever
+    # process build we'll use.
+    seed_dir = wasm2c_build_dir if not args.no_wasm2c else None
+
+    process_builds: list[tuple[str, Path]] = []
     if not args.no_process:
-        if not main_process_bin.exists():
-            print(f"[bench] {main_process_bin} missing; pass --no-process or rebuild", file=sys.stderr)
-            return 1
-        if not shim.exists():
-            print(f"[bench] {shim} missing — main_process needs it in CWD", file=sys.stderr)
-            return 1
-    if not pi_txt.exists():
-        print(f"[bench] {pi_txt} missing; cannot seed inputs", file=sys.stderr)
+        process_builds = parse_process_builds(args.process_builds)
+        for label, build_dir in process_builds:
+            if not (build_dir / "main_process").exists():
+                print(f"[bench] {build_dir}/main_process missing; configure "
+                      f"with -DRLBOX_TRANSPORT=... and rebuild",
+                      file=sys.stderr)
+                return 1
+            if not (build_dir / "sandbox_shim.so").exists():
+                print(f"[bench] {build_dir}/sandbox_shim.so missing",
+                      file=sys.stderr)
+                return 1
+            if not (build_dir / "pi.txt").exists():
+                print(f"[bench] {build_dir}/pi.txt missing; cannot seed",
+                      file=sys.stderr)
+                return 1
+        if seed_dir is None:
+            seed_dir = process_builds[0][1]
+    if seed_dir is None:
+        print("[bench] nothing to do — all backends disabled", file=sys.stderr)
         return 1
 
     bench_native = ensure_bench_native()
 
-    # Save original pi.txt so we can restore it after benchmarking.
-    source_bytes = pi_txt.read_bytes()
-    backup = pi_txt.with_suffix(".txt.bench_backup")
-    shutil.copyfile(pi_txt, backup)
-    print(f"[bench] backed up pi.txt -> {backup.name}", file=sys.stderr)
+    # Save the original pi.txt for each build dir we'll be writing to so we
+    # can restore them all after benchmarking.
+    write_dirs = []
+    if not args.no_wasm2c:
+        write_dirs.append(wasm2c_build_dir)
+    write_dirs.extend(d for _, d in process_builds)
+    backups: list[tuple[Path, Path]] = []
+    seed_bytes: Optional[bytes] = None
+    for d in write_dirs:
+        pi = d / "pi.txt"
+        if seed_bytes is None:
+            seed_bytes = pi.read_bytes()
+        backup = pi.with_suffix(".txt.bench_backup")
+        shutil.copyfile(pi, backup)
+        backups.append((pi, backup))
+    print(f"[bench] backed up pi.txt in {len(backups)} build dir(s)",
+          file=sys.stderr)
 
     all_rows: list[dict] = []
     try:
         for size in sizes:
-            prepare_input(build_dir, source_bytes, size)
+            for d in write_dirs:
+                prepare_input(d, seed_bytes, size)
             for level in levels:
                 print(f"[bench] size={size} level={level}", file=sys.stderr)
 
-                # Native reference — just needs the path to pi.txt.
+                # Native reference — runs from whichever dir we picked for
+                # seeding (pi.txt is identical across them).
+                native_pi = (write_dirs[0] / "pi.txt")
                 rows = run_config(
                     "native",
-                    [str(bench_native), str(pi_txt), str(level)],
-                    cwd=build_dir,
+                    [str(bench_native), str(native_pi), str(level)],
+                    cwd=write_dirs[0],
                     size=size,
                     level=level,
                     iters=args.iters,
@@ -199,7 +265,7 @@ def main() -> int:
                     rows = run_config(
                         "wasm2c",
                         [str(main_bin), str(level)],
-                        cwd=build_dir,
+                        cwd=wasm2c_build_dir,
                         size=size,
                         level=level,
                         iters=args.iters,
@@ -207,10 +273,10 @@ def main() -> int:
                     )
                     all_rows.extend(rows)
 
-                if not args.no_process:
+                for label, build_dir in process_builds:
                     rows = run_config(
-                        "process",
-                        [str(main_process_bin), str(level)],
+                        label,
+                        [str(build_dir / "main_process"), str(level)],
                         cwd=build_dir,
                         size=size,
                         level=level,
@@ -219,8 +285,9 @@ def main() -> int:
                     )
                     all_rows.extend(rows)
     finally:
-        shutil.move(str(backup), str(pi_txt))
-        print("[bench] restored pi.txt", file=sys.stderr)
+        for pi, backup in backups:
+            shutil.move(str(backup), str(pi))
+        print("[bench] restored pi.txt files", file=sys.stderr)
 
     # Write CSV.
     fields = ["backend", "size_bytes", "level", "iter", "wall_ms", "sandbox_ms", "native_ms"]
@@ -238,8 +305,8 @@ def main() -> int:
     for r in all_rows:
         by_key.setdefault(key(r), []).append(r)
 
-    print("\nbackend   size       level   metric        median_ms", file=sys.stderr)
-    print("-" * 64, file=sys.stderr)
+    print("\nbackend          size       level   metric        median_ms", file=sys.stderr)
+    print("-" * 72, file=sys.stderr)
     for k in sorted(by_key.keys()):
         rows = by_key[k]
         backend, size_bytes, level = k
@@ -249,7 +316,7 @@ def main() -> int:
         else:
             t = statistics.median(r["sandbox_ms"] for r in rows)
             metric = "sandbox"
-        print(f"{backend:<9} {size_bytes:<10} {level:<7} {metric:<12} {t:>10.2f}",
+        print(f"{backend:<16} {size_bytes:<10} {level:<7} {metric:<12} {t:>10.2f}",
               file=sys.stderr)
 
     return 0

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -21,14 +22,27 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef RLBOX_USE_CUSTOM_SHARED_LOCK
 #  include <shared_mutex>
 #endif
-#include "rpc/client.h"
-#include "rpc/server.h"
+
+#if !defined(RLBOX_TRANSPORT_RPCLIB) && !defined(RLBOX_TRANSPORT_CAPNP)
+#  define RLBOX_TRANSPORT_RPCLIB 1
+#endif
+
+#if defined(RLBOX_TRANSPORT_RPCLIB)
+#  include "rpc/client.h"
+#  include "rpc/server.h"
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+#  include <capnp/message.h>
+#  include <capnp/serialize.h>
+#  include <kj/exception.h>
+#  include "rlbox_process.capnp.h"
+#endif
 
 #include "rlbox_helpers.hpp"
 #include "rlbox_process_abi.hpp"
@@ -53,13 +67,28 @@ protected:
   uintptr_t shared_memory_local_base = 0;
   size_t shared_memory_size = 0;
   void* child_process_handle = nullptr;
+
+#if defined(RLBOX_TRANSPORT_RPCLIB)
   uint16_t rpc_port = 0;
   uint16_t callback_port = 0;
   std::unique_ptr<rpc::client> sandbox_client;
   std::unique_ptr<rpc::server> callback_server;
   std::unique_ptr<std::thread> callback_thread;
   std::mutex client_mutex;
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+  // Two SOCK_STREAM Unix socket pairs created before fork: one for the
+  // request channel (host -> shim) and one for callbacks (shim -> host).
+  // The host keeps the [0] ends; the [1] ends inherit across exec into
+  // the shim, which finds them via env vars.  No port discovery / no
+  // listen-wait dance required.
+  int request_fd = -1;
+  int callback_fd = -1;
+  std::mutex request_mutex;
+  std::unique_ptr<std::thread> callback_thread;
+  std::atomic<bool> callback_thread_stop{ false };
+#endif
 
+#if defined(RLBOX_TRANSPORT_RPCLIB)
   // Block until a loopback TCP port is accepting connections, or the
   // deadline elapses.  Returns true if a connect() succeeded.
   //
@@ -117,6 +146,7 @@ protected:
     ::close(sock);
     return ntohs(addr.sin_port);
   }
+#endif
 
   // Global registry to find sandboxes by pointer
   static inline std::map<uintptr_t, rlbox_process_sandbox*> global_registry;
@@ -129,8 +159,74 @@ protected:
     callback_map;
   std::mutex callback_mutex;
 
+  // ----- Transport-specific helpers ------------------------------------
+  //
+  // These thin wrappers hide the on-the-wire mechanics so the rest of the
+  // class is identical between transports.
+
+#if defined(RLBOX_TRANSPORT_CAPNP)
+  // Synchronous request/response over the request socket.  Mutex-serialized
+  // because the kernel doesn't preserve message boundaries for concurrent
+  // writers on a SOCK_STREAM, and we read directly afterward.
+  int64_t capnp_call(std::function<void(wire::Request::Builder&)> build)
+  {
+    std::lock_guard<std::mutex> lock(request_mutex);
+    if (request_fd < 0) {
+      return 0;
+    }
+    try {
+      capnp::MallocMessageBuilder out_msg;
+      auto req = out_msg.initRoot<wire::Request>();
+      build(req);
+      capnp::writeMessageToFd(request_fd, out_msg);
+      capnp::StreamFdMessageReader in_msg(request_fd);
+      return in_msg.getRoot<wire::Response>().getResult();
+    } catch (const kj::Exception&) {
+      return 0;
+    }
+  }
+
+  void start_callback_loop()
+  {
+    callback_thread = std::make_unique<std::thread>([this]() {
+      while (!callback_thread_stop.load()) {
+        try {
+          capnp::StreamFdMessageReader in_msg(callback_fd);
+          auto req = in_msg.getRoot<wire::CallbackRequest>();
+          uintptr_t key = req.getKey();
+          auto args_list = req.getArgs();
+          std::vector<int64_t> args;
+          args.reserve(args_list.size());
+          for (auto v : args_list) {
+            args.push_back(v);
+          }
+          int64_t result = 0;
+          std::function<int64_t(const std::vector<int64_t>&)> dispatcher;
+          {
+            std::lock_guard<std::mutex> lock(callback_mutex);
+            auto it = callback_map.find(key);
+            if (it != callback_map.end()) {
+              dispatcher = it->second;
+            }
+          }
+          if (dispatcher) {
+            result = dispatcher(args);
+          }
+          capnp::MallocMessageBuilder out_msg;
+          out_msg.initRoot<wire::CallbackResponse>().setResult(result);
+          capnp::writeMessageToFd(callback_fd, out_msg);
+        } catch (const kj::Exception&) {
+          // EOF / shim teardown — exit the loop cleanly.
+          return;
+        }
+      }
+    });
+  }
+#endif
+
   void* impl_lookup_symbol(const char* func_name)
   {
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     if (!sandbox_client) {
       return nullptr;
     }
@@ -141,8 +237,16 @@ protected:
     } catch (const std::exception&) {
       return nullptr;
     }
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    std::string name(func_name);
+    int64_t addr = capnp_call([&](wire::Request::Builder& req) {
+      req.setLookupSymbol(name);
+    });
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(addr));
+#endif
   }
 
+#if defined(RLBOX_TRANSPORT_RPCLIB)
   void start_callback_server(uint16_t port)
   {
     callback_port = port;
@@ -166,6 +270,7 @@ protected:
     callback_thread =
       std::make_unique<std::thread>([this]() { callback_server->run(); });
   }
+#endif
 
 public:
   template<typename T_Char>
@@ -210,6 +315,7 @@ public:
       global_registry[shared_memory_local_base] = this;
     }
 
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     // Pick free ports for both directions of the RPC connection.  The
     // child-facing RPC port is chosen by the host and handed to the shim
     // via an environment variable; likewise the callback-back-to-host port
@@ -225,6 +331,25 @@ public:
 
     // Start the callback server on a secondary port
     start_callback_server(chosen_callback_port);
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    // SOCK_STREAM Unix pairs.  We could use SOCK_SEQPACKET to get message
+    // boundaries for free, but Cap'n Proto's framing makes the choice
+    // transport-irrelevant — and SOCK_STREAM is the most universally
+    // available.  Both ends inherit across fork; the shim picks them up
+    // via env after exec.
+    int req_pair[2];
+    int cb_pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, req_pair) != 0) {
+      close(shm_fd);
+      return false;
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, cb_pair) != 0) {
+      close(req_pair[0]);
+      close(req_pair[1]);
+      close(shm_fd);
+      return false;
+    }
+#endif
 
     pid_t pid = fork();
     if (pid == -1) {
@@ -239,9 +364,19 @@ public:
       setenv("RLBOX_SHM_SIZE", std::to_string(shared_memory_size).c_str(), 1);
       setenv(
         "RLBOX_SHM_BASE", std::to_string(shared_memory_local_base).c_str(), 1);
+
+#if defined(RLBOX_TRANSPORT_RPCLIB)
       setenv("RLBOX_RPC_PORT", std::to_string(rpc_port).c_str(), 1);
       setenv(
         "RLBOX_CALLBACK_PORT", std::to_string(callback_port).c_str(), 1);
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+      // Close our (parent-side) ends in the child so dangling fds don't
+      // confuse poll/EOF semantics later.
+      close(req_pair[0]);
+      close(cb_pair[0]);
+      setenv("RLBOX_REQ_FD", std::to_string(req_pair[1]).c_str(), 1);
+      setenv("RLBOX_CB_FD", std::to_string(cb_pair[1]).c_str(), 1);
+#endif
 
       execl(reinterpret_cast<const char*>(library_path),
             reinterpret_cast<const char*>(library_path),
@@ -255,6 +390,7 @@ public:
     // Parent process
     child_process_handle = reinterpret_cast<void*>(static_cast<uintptr_t>(pid));
 
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     // Wait for the child's RPC server to actually accept connections
     // before constructing the client; rpc::client does a lazy connect
     // and wouldn't surface "not-yet-listening" as an error.
@@ -267,6 +403,16 @@ public:
     } catch (const std::exception&) {
       return false;
     }
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    // Close child-side fds in the parent — keeping them open would prevent
+    // EOF-driven shutdown of the request loop in the shim if the parent
+    // ever restarts the connection.
+    close(req_pair[1]);
+    close(cb_pair[1]);
+    request_fd = req_pair[0];
+    callback_fd = cb_pair[0];
+    start_callback_loop();
+#endif
     return true;
   }
 
@@ -282,6 +428,7 @@ public:
       global_registry.erase(shared_memory_local_base);
     }
 
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     sandbox_client.reset();
 
     if (callback_server) {
@@ -289,6 +436,24 @@ public:
       if (callback_thread && callback_thread->joinable())
         callback_thread->join();
     }
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    callback_thread_stop.store(true);
+    // Closing the request fd causes the shim's request loop to see EOF and
+    // exit; closing the callback fd makes our local read return EOF.
+    if (request_fd >= 0) {
+      shutdown(request_fd, SHUT_RDWR);
+      close(request_fd);
+      request_fd = -1;
+    }
+    if (callback_fd >= 0) {
+      shutdown(callback_fd, SHUT_RDWR);
+      close(callback_fd);
+      callback_fd = -1;
+    }
+    if (callback_thread && callback_thread->joinable()) {
+      callback_thread->join();
+    }
+#endif
 
     if (child_process_handle) {
       pid_t pid =
@@ -407,8 +572,12 @@ public:
   template<typename T, typename T_Converted, typename... T_Args>
   auto impl_invoke_with_func_ptr(T_Converted* func_ptr, T_Args&&... params)
   {
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     detail::dynamic_check(sandbox_client != nullptr,
                           "Sandbox not initialized");
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    detail::dynamic_check(request_fd >= 0, "Sandbox not initialized");
+#endif
 
     // Recover the original, pre-conversion parameter types from T so we
     // can emit ARG_POINTER for real pointer args (rlbox has already
@@ -425,6 +594,7 @@ public:
 
     constexpr int32_t ret_tag = abi_detail::tag_of_v<orig_ret_type>;
 
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     if constexpr (std::is_void_v<orig_ret_type>) {
       sandbox_client->call("invoke",
                            reinterpret_cast<T_PointerType>(func_ptr),
@@ -451,6 +621,29 @@ public:
         return static_cast<orig_ret_type>(raw);
       }
     }
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    int64_t raw = capnp_call([&](wire::Request::Builder& req) {
+      auto inv = req.initInvoke();
+      inv.setFuncAddr(reinterpret_cast<T_PointerType>(func_ptr));
+      inv.setRetTag(ret_tag);
+      auto tags = inv.initArgTags(arg_tags.size());
+      for (size_t i = 0; i < arg_tags.size(); ++i) {
+        tags.set(i, arg_tags[i]);
+      }
+      auto values = inv.initArgValues(arg_values.size());
+      for (size_t i = 0; i < arg_values.size(); ++i) {
+        values.set(i, arg_values[i]);
+      }
+    });
+    if constexpr (std::is_void_v<orig_ret_type>) {
+      (void)raw;
+      return;
+    } else if constexpr (std::is_pointer_v<orig_ret_type>) {
+      return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
+    } else {
+      return static_cast<orig_ret_type>(raw);
+    }
+#endif
   }
 
 private:
@@ -467,6 +660,7 @@ public:
 
   inline T_PointerType impl_malloc_in_sandbox(size_t size)
   {
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     if (!sandbox_client) {
       return 0;
     }
@@ -478,14 +672,26 @@ public:
     } catch (const std::exception&) {
       return 0;
     }
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    int64_t raw = capnp_call(
+      [&](wire::Request::Builder& req) { req.setAllocate(size); });
+    return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
+#endif
   }
 
   inline void impl_free_in_sandbox(T_PointerType p)
   {
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     if (!sandbox_client) {
       return;
     }
     sandbox_client->async_call("free", p);
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    // Synchronous on this transport — keeping the fd serialized round-trips
+    // simplifies framing.  The shim's free is cheap.
+    (void)capnp_call(
+      [&](wire::Request::Builder& req) { req.setRelease(static_cast<uint64_t>(p)); });
+#endif
   }
 
   // Cast an int64 wire slot back into the callback's expected Nth argument
@@ -532,10 +738,10 @@ public:
         };
     }
 
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     if (!sandbox_client) {
       return 0;
     }
-
     try {
       // Request the sandbox to create a trampoline for this callback key.
       // The sandbox returns a function pointer (as an offset) that can be
@@ -546,6 +752,12 @@ public:
     } catch (const std::exception&) {
       return 0;
     }
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    int64_t raw = capnp_call([&](wire::Request::Builder& req) {
+      req.setRegisterCallback(reinterpret_cast<uintptr_t>(key));
+    });
+    return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
+#endif
   }
 
   template<typename T_Ret, typename... T_Args>
@@ -556,10 +768,16 @@ public:
       callback_map.erase(reinterpret_cast<uintptr_t>(key));
     }
 
+#if defined(RLBOX_TRANSPORT_RPCLIB)
     if (sandbox_client) {
       sandbox_client->async_call("unregister_callback",
                                  reinterpret_cast<uintptr_t>(key));
     }
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    (void)capnp_call([&](wire::Request::Builder& req) {
+      req.setUnregisterCallback(reinterpret_cast<uintptr_t>(key));
+    });
+#endif
   }
 };
 

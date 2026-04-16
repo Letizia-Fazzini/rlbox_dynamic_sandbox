@@ -33,11 +33,60 @@ using rlbox::rlbox_process_sandbox;
 #endif
 
 namespace {
-// Exposes a few internals for targeted integration testing.
+// Exposes a few internals for targeted integration testing.  Helpers are
+// transport-agnostic so the same tests run under both rpclib and capnp.
 class IntegrationHarness : public rlbox_process_sandbox
 {
 public:
-  rpc::client* raw_client() { return this->sandbox_client.get(); }
+  // True when the host<->shim channel is up and ready for calls.
+  bool transport_alive() const
+  {
+#if defined(RLBOX_TRANSPORT_RPCLIB)
+    return this->sandbox_client != nullptr;
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    return this->request_fd >= 0;
+#else
+    return false;
+#endif
+  }
+
+  // Direct symbol lookup, exposing the wire return as uintptr_t.
+  uintptr_t raw_lookup_symbol(const std::string& name)
+  {
+    return reinterpret_cast<uintptr_t>(this->impl_lookup_symbol(name.c_str()));
+  }
+
+  // Send a typed invoke payload exactly as the wire schema expects, without
+  // going through impl_invoke_with_func_ptr's template plumbing.  This lets
+  // the wire schema be exercised with arbitrary tag/value combinations.
+  int64_t raw_invoke(uintptr_t func_addr,
+                     int32_t ret_tag,
+                     std::vector<int32_t> tags,
+                     std::vector<int64_t> values)
+  {
+#if defined(RLBOX_TRANSPORT_RPCLIB)
+    auto result = this->sandbox_client->call(
+      "invoke", func_addr, ret_tag, tags, values);
+    return result.template as<int64_t>();
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+    return this->capnp_call([&](rlbox::wire::Request::Builder& req) {
+      auto inv = req.initInvoke();
+      inv.setFuncAddr(func_addr);
+      inv.setRetTag(ret_tag);
+      auto t = inv.initArgTags(tags.size());
+      for (size_t i = 0; i < tags.size(); ++i) {
+        t.set(i, tags[i]);
+      }
+      auto v = inv.initArgValues(values.size());
+      for (size_t i = 0; i < values.size(); ++i) {
+        v.set(i, values[i]);
+      }
+    });
+#else
+    return 0;
+#endif
+  }
+
   using rlbox_process_sandbox::impl_free_in_sandbox;
   using rlbox_process_sandbox::impl_get_memory_location;
   using rlbox_process_sandbox::impl_get_sandboxed_pointer;
@@ -63,8 +112,8 @@ TEST_CASE("sandbox lifecycle: create then destroy cleanly",
   // TLS context should point at this sandbox.
   CHECK(rlbox::detail::thread_local_sandbox == &s);
 
-  // RPC client should be live.
-  CHECK(s.raw_client() != nullptr);
+  // RPC channel should be live.
+  CHECK(s.transport_alive());
 
   s.impl_destroy_sandbox();
 
@@ -153,13 +202,11 @@ TEST_CASE("lookup_symbol resolves functions linked into the sandbox child",
 
   // Call the shim's lookup_symbol handler directly.  Non-zero return means
   // dlsym resolved the symbol inside the child process.
-  auto res = s.raw_client()->call("lookup_symbol", std::string("glue_add"));
-  auto encoded_ptr = res.as<uintptr_t>();
+  auto encoded_ptr = s.raw_lookup_symbol("glue_add");
   CHECK(encoded_ptr != 0);
 
-  auto missing =
-    s.raw_client()->call("lookup_symbol", std::string("not_a_real_symbol_xyz"));
-  CHECK(missing.as<uintptr_t>() == 0);
+  auto missing = s.raw_lookup_symbol("not_a_real_symbol_xyz");
+  CHECK(missing == 0);
 
   s.impl_destroy_sandbox();
 }
@@ -171,17 +218,15 @@ TEST_CASE("invoke executes a simple C function via libffi in the child",
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
   // Resolve glue_add in the child.
-  auto lookup =
-    s.raw_client()->call("lookup_symbol", std::string("glue_add"));
-  auto encoded = lookup.as<uintptr_t>();
+  auto encoded = s.raw_lookup_symbol("glue_add");
   REQUIRE(encoded != 0);
 
   // New typed schema: (func_offset, ret_tag, arg_tags, arg_values).
   std::vector<int32_t> arg_tags = { rlbox::ARG_SINT64, rlbox::ARG_SINT64 };
   std::vector<int64_t> arg_values = { 7, 35 };
-  auto result = s.raw_client()->call(
-    "invoke", encoded, (int32_t)rlbox::ARG_SINT64, arg_tags, arg_values);
-  CHECK(result.as<int64_t>() == 42);
+  int64_t result =
+    s.raw_invoke(encoded, (int32_t)rlbox::ARG_SINT64, arg_tags, arg_values);
+  CHECK(result == 42);
 
   s.impl_destroy_sandbox();
 }
@@ -200,9 +245,7 @@ TEST_CASE("invoke writes through a POINTER-tagged arg into shared memory",
   *host_view = 0;
 
   // Resolve glue_write_int64: int64_t(int64_t*, int64_t).
-  auto lookup =
-    s.raw_client()->call("lookup_symbol", std::string("glue_write_int64"));
-  auto encoded = lookup.as<uintptr_t>();
+  auto encoded = s.raw_lookup_symbol("glue_write_int64");
   REQUIRE(encoded != 0);
 
   // Send the pointer arg as an ARG_POINTER carrying an absolute address
@@ -212,10 +255,10 @@ TEST_CASE("invoke writes through a POINTER-tagged arg into shared memory",
   std::vector<int32_t> arg_tags = { rlbox::ARG_POINTER, rlbox::ARG_SINT64 };
   std::vector<int64_t> arg_values = { static_cast<int64_t>(addr),
                                       0xDEADBEEFLL };
-  auto result = s.raw_client()->call(
-    "invoke", encoded, (int32_t)rlbox::ARG_SINT64, arg_tags, arg_values);
+  int64_t result =
+    s.raw_invoke(encoded, (int32_t)rlbox::ARG_SINT64, arg_tags, arg_values);
 
-  CHECK(result.as<int64_t>() == 0xDEADBEEFLL);
+  CHECK(result == 0xDEADBEEFLL);
   CHECK(*host_view == 0xDEADBEEFLL);
 
   s.impl_free_in_sandbox(addr);
@@ -230,9 +273,7 @@ TEST_CASE("impl_invoke_with_func_ptr emits typed payload and round-trips",
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
-  auto lookup =
-    s.raw_client()->call("lookup_symbol", std::string("glue_add"));
-  auto encoded = lookup.as<uintptr_t>();
+  auto encoded = s.raw_lookup_symbol("glue_add");
   REQUIRE(encoded != 0);
 
   using Func_T = int64_t(int64_t, int64_t);

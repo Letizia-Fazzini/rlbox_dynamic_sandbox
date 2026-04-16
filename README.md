@@ -1,18 +1,21 @@
-[![Tests](https://github.com/PLSysSec/rlbox_wasm2c_sandbox/actions/workflows/cmake.yml/badge.svg)](https://github.com/PLSysSec/rlbox_wasm2c_sandbox/actions/workflows/cmake.yml)
+# RLBox Process Sandbox
 
-# RLBox Wasm2c Sandbox Integration
+A process-isolation backend for [RLBox](https://github.com/PLSysSec/rlbox). Each sandboxed function call runs in a fresh OS process, so we can compare per-call process isolation against the stock wasm2c backend.
 
-Integration with RLBox sandboxing API to leverage the sandboxing in WASM modules compiled with the wasm2c compiler (from the [wabt](https://github.com/WebAssembly/wabt/) toolsuite).
+## Layout
 
-For details about the RLBox sandboxing APIs, see [here](https://github.com/PLSysSec/rlbox).
+| Path | What it is |
+| --- | --- |
+| `include/rlbox_process_sandbox.hpp` | Host-side sandbox class (implements the RLBox `T_Sbx` contract). |
+| `src/rlbox_process_sandbox_shim.cpp` | `LD_PRELOAD`-ed shim the child process runs; hosts the RPC server, libffi dispatch, and trampoline pool. |
+| `c_src/process_sandbox_wrapper.c` | Minimal wrapper binary that loads the target library and blocks forever so the shim can handle RPCs. |
+| `include/rlbox_process_abi.hpp` | Wire schema shared between host and shim (argument type tags). |
+| `include/rlbox_process_mem.hpp`, `include/rlbox_process_tls.hpp`, `src/rlbox_process_tls.cpp` | Shared-memory allocator + thread-local sandbox pointer used by RLBox's `_no_ctx` helpers. |
+| `test/test_*.cpp` | Unit + integration tests for pointer ops, memory alignment, and end-to-end invoke/callback paths. |
+| `test/zlib-testing/` | End-to-end zlib port. `main.cpp` runs under wasm2c, `main_process.cpp` runs under the process backend. |
+| `bench/` | Benchmark harness comparing native, wasm2c, and process backends on zlib. |
 
-## Reporting security bugs
-
-If you find a security bug, please do not create a public issue. Instead, file a security bug on bugzilla using the [following template link](https://bugzilla.mozilla.org/enter_bug.cgi?cc=tom%40mozilla.com&cc=nfroyd%40mozilla.com&cc=deian%40cs.ucsd.edu&cc=shravanrn%40gmail.com&component=Security%3A%20Process%20Sandboxing&defined_groups=1&groups=core-security&product=Core&bug_type=defect).
-
-## Building/Running the tests
-
-You can build and run the tests using cmake with the following commands.
+## Building and running the tests
 
 ```bash
 cmake -S . -B ./build
@@ -20,76 +23,42 @@ cmake --build ./build --parallel
 cmake --build ./build --target test
 ```
 
-On Arch Linux you'll need to install [ncurses5-compat-libs](https://aur.archlinux.org/packages/ncurses5-compat-libs/).
-
-## Using this tool
-
-First, build the rlbox_wasm2c_sandbox repo with
+The host↔shim wire protocol is selectable at configure time:
 
 ```bash
-cmake -S . -B ./build
-cmake --build ./build --target all
+cmake -DRLBOX_TRANSPORT=rpclib -S . -B build_rpclib   # default
+cmake -DRLBOX_TRANSPORT=capnp  -S . -B build_capnp    # Cap'n Proto over UNIX socket
 ```
 
-This wasm2c/wasm integration with RLBox depends on 3 external tools/libraries that are pulled in **automatically** to run the tests included in this repo.
+When `capnp` is selected, Cap'n Proto is fetched via FetchContent if not present on the system. Both transports pass the same test suite; the bench harness drives both and reports a side-by-side comparison.
 
-1. [A clang compiler with support for WASM/WASI backend, and the WASI sysroot](https://github.com/CraneStation/wasi-sdk). This allows you to compile C/C++ code to WASM modules usable outside of web browsers (in desktop applications).
-2. [The wasm2c compiler](https://github.com/WebAssembly/wabt/) that compiles the produced WASM/WASI module to C code that you can compile with a standard C compiler.
-3. [The RLBox APIs](https://github.com/PLSysSec/rlbox) - A set of APIs that allow easy use of sandboxed code. It handles ABI differences between sandboxed (Wasm) code and native code, and ensures that you include data sanitization checks on untrusted data returned by the sandboxed C code.
+Dev build (warnings-as-errors, address sanitizer, clang-tidy if installed):
 
-In the below steps, you can either use the automatically pulled in versions as described below, or download the tools yourself.
+```bash
+cmake -DCMAKE_BUILD_TYPE=Debug -DDEV=ON -S . -B ./build
+```
 
-To sandbox a library of your choice and use the sandboxed library in an application follow the RLBox tutorial [here](https://rlbox.dev)
+## zlib end-to-end test
 
+Uses `add_subdirectory` to pull this repo in and builds two variants side-by-side: `main` (wasm2c) and `main_process` (process backend).
 
-## Contributing Code
+```bash
+cd test/zlib-testing
+cmake -S . -B ./build
+cmake --build ./build --parallel
+cd build
+./main_process 6     # process backend, compression level 6
+./main 6             # wasm2c backend (requires wasi-sdk; auto-fetched)
+```
 
-1. To contribute code, it is recommended you install clang-tidy which the build
-uses if available. Install using:
+Both compress `pi.txt` and verify byte-identical output against stock libz.
 
-   On Ubuntu:
+## Benchmarks
 
-   ```bash
-   sudo apt install clang-tidy
-   ```
+```bash
+cd bench
+python3 run_benchmarks.py      # writes results.csv
+python3 plot_results.py        # writes plots/*.png
+```
 
-   On Arch Linux:
-
-   ```bash
-   sudo pacman -S clang-tidy
-   ```
-
-2. It is recommended you use the dev mode for building during development. This
-treat warnings as errors, enables clang-tidy checks, runs address sanitizer etc.
-Also, you probably want to use the debug build. To do this, adjust your build
-settings as shown below
-
-   ```bash
-   cmake -DCMAKE_BUILD_TYPE=Debug -DDEV=ON -S . -B ./build
-   ```
-
-3. After making changes to the source, add any new required tests and run all
-tests as described earlier.
-
-4. To make sure all code/docs are formatted with, we use clang-format.
-Install using:
-
-   On Ubuntu:
-
-   ```bash
-   sudo apt install clang-format
-   ```
-
-   On Arch Linux:
-
-   ```bash
-   sudo pacman -S clang-format
-   ```
-
-5. Format code with the format-source target:
-
-   ```bash
-   cmake --build ./build --target format-source
-   ```
-
-6. Submit the pull request.
+Driver flags: `--sizes`, `--levels`, `--iters`, `--no-wasm2c`, `--no-process`. See `bench/README.md` for details.

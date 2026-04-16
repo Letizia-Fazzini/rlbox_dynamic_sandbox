@@ -13,20 +13,118 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(RLBOX_DYNAMIC_BUILD_TESTS "Build unit + integration tests" ON)
 
+# Transport selection ###################
+#
+# The host<->shim wire protocol is pluggable at compile time.  rpclib gives us
+# a small, dependency-light baseline (msgpack + asio over TCP loopback).  capnp
+# swaps in Cap'n Proto serialization over Unix abstract sockets — fewer bytes
+# on the wire, no event-loop wrapper, and no localhost TCP setup cost.
+set(RLBOX_TRANSPORT "rpclib" CACHE STRING
+    "Wire transport for host<->shim RPC: rpclib | capnp")
+set_property(CACHE RLBOX_TRANSPORT PROPERTY STRINGS rpclib capnp)
+
+if(NOT RLBOX_TRANSPORT STREQUAL "rpclib" AND
+   NOT RLBOX_TRANSPORT STREQUAL "capnp")
+  message(FATAL_ERROR
+          "RLBOX_TRANSPORT must be 'rpclib' or 'capnp', got '${RLBOX_TRANSPORT}'")
+endif()
+message(STATUS "rlbox_dynamic transport: ${RLBOX_TRANSPORT}")
+
 # Dependencies ###################
 
 include(FetchContent)
 
-FetchContent_Declare(
-  rpclib
-  GIT_REPOSITORY https://github.com/rpclib/rpclib.git
-  GIT_TAG v2.3.0)
-FetchContent_MakeAvailable(rpclib)
+if(RLBOX_TRANSPORT STREQUAL "rpclib")
+  FetchContent_Declare(
+    rpclib
+    GIT_REPOSITORY https://github.com/rpclib/rpclib.git
+    GIT_TAG v2.3.0)
+  FetchContent_MakeAvailable(rpclib)
+else()
+  # Cap'n Proto: prefer system install, fall back to FetchContent.  Building
+  # capnp from source is non-trivial (the schema compiler is a real C++ binary)
+  # so the system package is much faster when available.
+  find_package(CapnProto CONFIG QUIET)
+  if(NOT CapnProto_FOUND)
+    message(STATUS "system Cap'n Proto not found; fetching v1.0.2")
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(CAPNP_BUILD_TOOLS ON CACHE BOOL "" FORCE)
+    # Cap'n Proto's CMake hard-requires gnu extensions for some platform
+    # detection; flip this on just for the fetch so our own translation
+    # units stay strict.
+    set(_rlbox_saved_cxx_ext ${CMAKE_CXX_EXTENSIONS})
+    set(CMAKE_CXX_EXTENSIONS ON)
+    FetchContent_Declare(
+      capnproto
+      GIT_REPOSITORY https://github.com/capnproto/capnproto.git
+      GIT_TAG v1.0.2
+      SOURCE_SUBDIR c++)
+    FetchContent_MakeAvailable(capnproto)
+    set(CMAKE_CXX_EXTENSIONS ${_rlbox_saved_cxx_ext})
+  endif()
+endif()
 
 FetchContent_Declare(
   rlbox
   GIT_REPOSITORY https://github.com/PLSysSec/rlbox.git)
 FetchContent_MakeAvailable(rlbox)
+
+# Capnp schema codegen ###################
+
+if(RLBOX_TRANSPORT STREQUAL "capnp")
+  # Generate <rlbox_process.capnp.h>/<.c++> next to the schema; the header is
+  # picked up via the include path on rlbox_dynamic.
+  set(RLBOX_CAPNP_SCHEMA ${CMAKE_CURRENT_SOURCE_DIR}/include/rlbox_process.capnp)
+  set(RLBOX_CAPNP_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/capnp_gen)
+  file(MAKE_DIRECTORY ${RLBOX_CAPNP_GEN_DIR})
+  set(RLBOX_CAPNP_GEN_HDR ${RLBOX_CAPNP_GEN_DIR}/rlbox_process.capnp.h)
+  set(RLBOX_CAPNP_GEN_SRC ${RLBOX_CAPNP_GEN_DIR}/rlbox_process.capnp.c++)
+  # Resolve the capnp tool + the C++ plugin.  Both are needed: capnp loads
+  # the plugin by name (capnpc-c++) from PATH, but with FetchContent the
+  # plugin lives in the build tree, so we hand the absolute path explicitly
+  # via the `-o /path/to/plugin` form.
+  if(TARGET CapnProto::capnp_tool)
+    set(_capnp_tool $<TARGET_FILE:CapnProto::capnp_tool>)
+  elseif(TARGET capnp_tool)
+    set(_capnp_tool $<TARGET_FILE:capnp_tool>)
+  else()
+    message(FATAL_ERROR "Cap'n Proto schema compiler target not found")
+  endif()
+  if(TARGET CapnProto::capnpc_cpp)
+    set(_capnp_cpp_plugin $<TARGET_FILE:CapnProto::capnpc_cpp>)
+  elseif(TARGET capnpc_cpp)
+    set(_capnp_cpp_plugin $<TARGET_FILE:capnpc_cpp>)
+  else()
+    set(_capnp_cpp_plugin "c++")
+  endif()
+  # System install ships /capnp/c++.capnp under the include prefix; with
+  # FetchContent we have to point the tool at the in-tree copy explicitly.
+  if(capnproto_SOURCE_DIR)
+    set(_capnp_import_dir ${capnproto_SOURCE_DIR}/c++/src)
+  else()
+    # System install: rely on the tool's default search path.
+    set(_capnp_import_dir "")
+  endif()
+  set(_capnp_import_arg "")
+  if(_capnp_import_dir)
+    set(_capnp_import_arg -I${_capnp_import_dir})
+  endif()
+  add_custom_command(
+    OUTPUT ${RLBOX_CAPNP_GEN_HDR} ${RLBOX_CAPNP_GEN_SRC}
+    COMMAND ${_capnp_tool} compile -o${_capnp_cpp_plugin}:${RLBOX_CAPNP_GEN_DIR}
+            ${_capnp_import_arg}
+            --src-prefix=${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${RLBOX_CAPNP_SCHEMA}
+    DEPENDS ${RLBOX_CAPNP_SCHEMA}
+    COMMENT "Generating Cap'n Proto schema for rlbox_process")
+  add_library(rlbox_capnp_schema STATIC ${RLBOX_CAPNP_GEN_SRC})
+  target_include_directories(rlbox_capnp_schema PUBLIC ${RLBOX_CAPNP_GEN_DIR})
+  if(TARGET CapnProto::capnp)
+    target_link_libraries(rlbox_capnp_schema PUBLIC CapnProto::capnp)
+  else()
+    target_link_libraries(rlbox_capnp_schema PUBLIC capnp)
+  endif()
+endif()
 
 # Core INTERFACE library ###################
 
@@ -34,7 +132,13 @@ add_library(rlbox_dynamic INTERFACE)
 target_include_directories(rlbox_dynamic INTERFACE
                            ${CMAKE_CURRENT_SOURCE_DIR}/include
                            ${rlbox_SOURCE_DIR}/code/include)
-target_link_libraries(rlbox_dynamic INTERFACE rpc)
+if(RLBOX_TRANSPORT STREQUAL "rpclib")
+  target_link_libraries(rlbox_dynamic INTERFACE rpc)
+  target_compile_definitions(rlbox_dynamic INTERFACE RLBOX_TRANSPORT_RPCLIB=1)
+else()
+  target_link_libraries(rlbox_dynamic INTERFACE rlbox_capnp_schema)
+  target_compile_definitions(rlbox_dynamic INTERFACE RLBOX_TRANSPORT_CAPNP=1)
+endif()
 
 # --- Sandbox shim (LD_PRELOADed into the child process) ---
 #
@@ -93,7 +197,14 @@ add_library(sandbox_shim SHARED
 target_include_directories(sandbox_shim PRIVATE
                            ${CMAKE_CURRENT_SOURCE_DIR}/include
                            ${LIBFFI_INCLUDE_DIR})
-target_link_libraries(sandbox_shim PRIVATE rpc dl pthread ${LIBFFI_LIBRARY})
+target_link_libraries(sandbox_shim PRIVATE dl pthread ${LIBFFI_LIBRARY})
+if(RLBOX_TRANSPORT STREQUAL "rpclib")
+  target_link_libraries(sandbox_shim PRIVATE rpc)
+  target_compile_definitions(sandbox_shim PRIVATE RLBOX_TRANSPORT_RPCLIB=1)
+else()
+  target_link_libraries(sandbox_shim PRIVATE rlbox_capnp_schema)
+  target_compile_definitions(sandbox_shim PRIVATE RLBOX_TRANSPORT_CAPNP=1)
+endif()
 set_target_properties(sandbox_shim PROPERTIES
                       PREFIX ""              # produce "sandbox_shim.so"
                       OUTPUT_NAME sandbox_shim)

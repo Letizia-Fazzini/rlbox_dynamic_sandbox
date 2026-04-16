@@ -22,17 +22,61 @@ import numpy as np
 
 BENCH_DIR = Path(__file__).resolve().parent
 
-BACKEND_ORDER = ["native", "wasm2c", "process"]
-BACKEND_COLORS = {
+# Canonical ordering and styling for known backends.  Any backend name not
+# listed here gets the next free matplotlib tab10 color and its raw name as
+# the legend label, so adding a new transport (or a new backend entirely) is
+# zero-config.
+KNOWN_BACKEND_ORDER = [
+    "native",
+    "wasm2c",
+    "process",
+    "process_rpclib",
+    "process_capnp",
+    "rpclib",
+    "capnp",
+]
+KNOWN_COLORS = {
     "native": "#1f77b4",
     "wasm2c": "#ff7f0e",
     "process": "#2ca02c",
+    "process_rpclib": "#d62728",
+    "process_capnp": "#9467bd",
+    "rpclib": "#d62728",
+    "capnp": "#9467bd",
 }
-BACKEND_LABELS = {
+KNOWN_LABELS = {
     "native": "native zlib",
     "wasm2c": "RLBox wasm2c",
     "process": "RLBox process",
+    "process_rpclib": "process (rpclib)",
+    "process_capnp": "process (capnp)",
+    "rpclib": "process (rpclib)",
+    "capnp": "process (capnp)",
 }
+# Fallback palette for unknown backends.
+_FALLBACK_COLORS = [
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+]
+
+
+def order_backends(rows: list[dict]) -> list[str]:
+    """All backends present in the CSV, ordered by the canonical list with
+    unknowns appended in first-seen order."""
+    seen = []
+    for r in rows:
+        if r["backend"] not in seen:
+            seen.append(r["backend"])
+    known = [b for b in KNOWN_BACKEND_ORDER if b in seen]
+    extra = [b for b in seen if b not in known]
+    return known + extra
+
+
+def color_for(backend: str, idx: int) -> str:
+    return KNOWN_COLORS.get(backend, _FALLBACK_COLORS[idx % len(_FALLBACK_COLORS)])
+
+
+def label_for(backend: str) -> str:
+    return KNOWN_LABELS.get(backend, backend)
 
 
 def load_rows(path: Path) -> list[dict]:
@@ -82,7 +126,7 @@ def human_size(n: int) -> str:
 
 
 def plot_time_vs_size(rows: list[dict], meds: dict, out_path: Path) -> None:
-    backends = [b for b in BACKEND_ORDER if any(r["backend"] == b for r in rows)]
+    backends = order_backends(rows)
     levels = sorted({r["level"] for r in rows})
     sizes = sorted({r["size_bytes"] for r in rows})
 
@@ -90,7 +134,7 @@ def plot_time_vs_size(rows: list[dict], meds: dict, out_path: Path) -> None:
         1, len(levels), figsize=(4.5 * len(levels), 4.2), sharey=True, squeeze=False
     )
     for ax, level in zip(axes[0], levels):
-        for backend in backends:
+        for i, backend in enumerate(backends):
             ys = [meds.get((backend, s, level)) for s in sizes]
             if all(y is None for y in ys):
                 continue
@@ -98,8 +142,8 @@ def plot_time_vs_size(rows: list[dict], meds: dict, out_path: Path) -> None:
                 sizes,
                 ys,
                 marker="o",
-                label=BACKEND_LABELS[backend],
-                color=BACKEND_COLORS[backend],
+                label=label_for(backend),
+                color=color_for(backend, i),
                 linewidth=2,
             )
         ax.set_xscale("log")
@@ -117,9 +161,7 @@ def plot_time_vs_size(rows: list[dict], meds: dict, out_path: Path) -> None:
 
 
 def plot_overhead(rows: list[dict], meds: dict, out_path: Path) -> None:
-    sandbox_backends = [
-        b for b in BACKEND_ORDER if b != "native" and any(r["backend"] == b for r in rows)
-    ]
+    sandbox_backends = [b for b in order_backends(rows) if b != "native"]
     levels = sorted({r["level"] for r in rows})
     sizes = sorted({r["size_bytes"] for r in rows})
 
@@ -140,8 +182,8 @@ def plot_overhead(rows: list[dict], meds: dict, out_path: Path) -> None:
                 x + offset,
                 ratios,
                 width,
-                label=BACKEND_LABELS[backend],
-                color=BACKEND_COLORS[backend],
+                label=label_for(backend),
+                color=color_for(backend, i),
             )
         ax.axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.5)
         ax.set_xticks(x)
@@ -159,7 +201,7 @@ def plot_overhead(rows: list[dict], meds: dict, out_path: Path) -> None:
 
 
 def plot_throughput(rows: list[dict], meds: dict, out_path: Path) -> None:
-    backends = [b for b in BACKEND_ORDER if any(r["backend"] == b for r in rows)]
+    backends = order_backends(rows)
     levels = sorted({r["level"] for r in rows})
     sizes = sorted({r["size_bytes"] for r in rows})
 
@@ -180,8 +222,8 @@ def plot_throughput(rows: list[dict], meds: dict, out_path: Path) -> None:
                 x + offset,
                 thr,
                 width,
-                label=BACKEND_LABELS[backend],
-                color=BACKEND_COLORS[backend],
+                label=label_for(backend),
+                color=color_for(backend, i),
             )
         ax.set_xticks(x)
         ax.set_xticklabels([human_size(s) for s in sizes])
