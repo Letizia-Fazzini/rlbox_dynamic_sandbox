@@ -31,6 +31,7 @@
 #include "rpc/server.h"
 
 #include "rlbox_helpers.hpp"
+#include "rlbox_process_abi.hpp"
 #include "rlbox_process_mem.hpp"
 #include "rlbox_process_tls.hpp"
 
@@ -38,8 +39,12 @@ namespace rlbox {
 class rlbox_process_sandbox
 {
 public:
+  // The child is a native Linux x86_64 process sharing the host ABI, so
+  // the integer widths mirror the host.  T_PointerType stays as an
+  // unsigned integer because rlbox's tainted<T*> is serialized as a
+  // sandbox offset on the wire (offset = host_addr - shared_memory_base).
   using T_LongLongType = int64_t;
-  using T_LongType = int32_t;
+  using T_LongType = int64_t;
   using T_IntType = int32_t;
   using T_PointerType = uintptr_t;
   using T_ShortType = int16_t;
@@ -117,8 +122,10 @@ protected:
   static inline std::map<uintptr_t, rlbox_process_sandbox*> global_registry;
   static inline std::mutex registry_mutex;
 
-  // Callback key to function mapping
-  std::map<uintptr_t, std::function<clmdep_msgpack::object(clmdep_msgpack::object)>>
+  // Callback dispatchers keyed by host-side unique key.  Each dispatcher
+  // takes the int64-widened argument slots coming off the wire and returns
+  // the callback's result (also widened to int64; 0 for void returns).
+  std::map<uintptr_t, std::function<int64_t(const std::vector<int64_t>&)>>
     callback_map;
   std::mutex callback_mutex;
 
@@ -141,8 +148,9 @@ protected:
     callback_port = port;
     callback_server = std::make_unique<rpc::server>(port);
     callback_server->bind(
-      "trigger_callback", [this](uintptr_t key, clmdep_msgpack::object params) {
-        std::function<clmdep_msgpack::object(clmdep_msgpack::object)> dispatcher;
+      "trigger_callback",
+      [this](uintptr_t key, std::vector<int64_t> args) -> int64_t {
+        std::function<int64_t(const std::vector<int64_t>&)> dispatcher;
         {
           std::lock_guard<std::mutex> lock(callback_mutex);
           auto it = callback_map.find(key);
@@ -151,9 +159,9 @@ protected:
           }
         }
         if (dispatcher) {
-          return dispatcher(params);
+          return dispatcher(args);
         }
-        return clmdep_msgpack::object();
+        return 0;
       });
     callback_thread =
       std::make_unique<std::thread>([this]() { callback_server->run(); });
@@ -229,6 +237,8 @@ public:
       setenv("LD_PRELOAD", "./sandbox_shim.so", 1);
       setenv("RLBOX_SHM_FD", std::to_string(shm_fd).c_str(), 1);
       setenv("RLBOX_SHM_SIZE", std::to_string(shared_memory_size).c_str(), 1);
+      setenv(
+        "RLBOX_SHM_BASE", std::to_string(shared_memory_local_base).c_str(), 1);
       setenv("RLBOX_RPC_PORT", std::to_string(rpc_port).c_str(), 1);
       setenv(
         "RLBOX_CALLBACK_PORT", std::to_string(callback_port).c_str(), 1);
@@ -291,23 +301,21 @@ public:
     }
   }
 
+  // Host and child map shared memory at the same virtual address, so the
+  // "sandbox-side" representation of a pointer is just its absolute
+  // address — no offset math.  This is what lets native C code in the
+  // sandbox write absolute pointers into shared structs and have the host
+  // read the same bytes back as valid pointers.
   template<typename T>
   inline void* impl_get_unsandboxed_pointer(T_PointerType p) const
   {
-    if (shared_memory_local_base == 0 || p == 0) {
-      return reinterpret_cast<void*>(p);
-    }
-    return reinterpret_cast<void*>(shared_memory_local_base + p);
+    return reinterpret_cast<void*>(p);
   }
 
   template<typename T>
   inline T_PointerType impl_get_sandboxed_pointer(const void* p) const
   {
-    if (shared_memory_local_base == 0 || p == 0) {
-      return reinterpret_cast<T_PointerType>(p);
-    }
-    return static_cast<T_PointerType>(reinterpret_cast<uintptr_t>(p) -
-                                      shared_memory_local_base);
+    return reinterpret_cast<T_PointerType>(p);
   }
 
   template<typename T>
@@ -338,10 +346,29 @@ public:
     return sandbox->impl_get_sandboxed_pointer<T>(p);
   }
 
-  inline bool impl_is_in_same_sandbox(const void* p1, const void* p2)
+  // Static because rlbox_sandbox<T_Sbx>::is_in_same_sandbox calls it as
+  // T_Sbx::impl_is_in_same_sandbox(...) without an instance.  We resolve
+  // each pointer against the global registry and return true only when
+  // both land inside the *same* sandbox's shared region.
+  // RLBox's memcpy/memset guards use this as "are these two endpoints of
+  // a range on the same side of the app/sandbox boundary" — i.e. safe if
+  // they're both in the same sandbox OR both outside every sandbox.
+  static inline bool impl_is_in_same_sandbox(const void* p1, const void* p2)
   {
-    return impl_is_pointer_in_sandbox_memory(p1) &&
-           impl_is_pointer_in_sandbox_memory(p2);
+    auto addr1 = reinterpret_cast<uintptr_t>(p1);
+    auto addr2 = reinterpret_cast<uintptr_t>(p2);
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    auto sandbox_of = [&](uintptr_t a) -> rlbox_process_sandbox* {
+      for (auto& entry : global_registry) {
+        auto base = entry.first;
+        auto size = entry.second->shared_memory_size;
+        if (a >= base && a < base + size) {
+          return entry.second;
+        }
+      }
+      return nullptr;
+    };
+    return sandbox_of(addr1) == sandbox_of(addr2);
   }
   inline bool impl_is_pointer_in_sandbox_memory(const void* p)
   {
@@ -362,24 +389,81 @@ public:
     return reinterpret_cast<void*>(shared_memory_local_base);
   }
 
+  // Widen an already-converted argument into an int64 wire slot.  Pointer
+  // args arrive as T_PointerType (sandbox offsets) because rlbox converted
+  // tainted<T*> before calling us — so we can cast them straight into the
+  // slot with no extra translation on the host side.
+  template<typename A>
+  static int64_t pack_slot(A&& v)
+  {
+    using U = std::remove_cv_t<std::remove_reference_t<A>>;
+    if constexpr (std::is_pointer_v<U>) {
+      return static_cast<int64_t>(reinterpret_cast<uintptr_t>(v));
+    } else {
+      return static_cast<int64_t>(v);
+    }
+  }
+
   template<typename T, typename T_Converted, typename... T_Args>
   auto impl_invoke_with_func_ptr(T_Converted* func_ptr, T_Args&&... params)
   {
     detail::dynamic_check(sandbox_client != nullptr,
                           "Sandbox not initialized");
 
-    if constexpr (std::is_void_v<T>) {
+    // Recover the original, pre-conversion parameter types from T so we
+    // can emit ARG_POINTER for real pointer args (rlbox has already
+    // substituted them away in T_Args and T_Converted).
+    using orig_args_tuple = typename abi_detail::function_traits<T>::args_tuple;
+    using orig_ret_type = typename abi_detail::function_traits<T>::return_type;
+
+    std::vector<int32_t> arg_tags;
+    arg_tags.reserve(sizeof...(T_Args));
+    build_tags_from_tuple<orig_args_tuple>(
+      arg_tags, std::make_index_sequence<sizeof...(T_Args)>{});
+
+    std::vector<int64_t> arg_values{ pack_slot(std::forward<T_Args>(params))... };
+
+    constexpr int32_t ret_tag = abi_detail::tag_of_v<orig_ret_type>;
+
+    if constexpr (std::is_void_v<orig_ret_type>) {
       sandbox_client->call("invoke",
                            reinterpret_cast<T_PointerType>(func_ptr),
-                           std::forward<T_Args>(params)...);
+                           ret_tag,
+                           arg_tags,
+                           arg_values);
     } else {
       auto result =
         sandbox_client->call("invoke",
                              reinterpret_cast<T_PointerType>(func_ptr),
-                             std::forward<T_Args>(params)...);
-      return result.template as<T>();
+                             ret_tag,
+                             arg_tags,
+                             arg_values);
+      int64_t raw = result.template as<int64_t>();
+      // rlbox's convert_type expects the sandbox-equivalent representation
+      // of the return value.  For pointer returns that's T_PointerType (the
+      // sandbox offset).  For scalars the caller's static_cast handles any
+      // further narrowing, so returning the original scalar type is enough;
+      // the cast from int64 truncates safely because the wire slot already
+      // holds a value representable in orig_ret_type.
+      if constexpr (std::is_pointer_v<orig_ret_type>) {
+        return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
+      } else {
+        return static_cast<orig_ret_type>(raw);
+      }
     }
   }
+
+private:
+  template<typename Tuple, std::size_t... I>
+  static void build_tags_from_tuple(std::vector<int32_t>& out,
+                                    std::index_sequence<I...>)
+  {
+    (out.push_back(
+       abi_detail::tag_of_v<std::tuple_element_t<I, Tuple>>),
+     ...);
+  }
+
+public:
 
   inline T_PointerType impl_malloc_in_sandbox(size_t size)
   {
@@ -387,7 +471,8 @@ public:
       return 0;
     }
     try {
-      // The RPC handler in the child should call malloc and return the offset
+      // RPC-allocates via dlmalloc in the child and returns the absolute
+      // address, which is valid on both sides thanks to same-base mapping.
       auto result = sandbox_client->call("malloc", size);
       return result.as<T_PointerType>();
     } catch (const std::exception&) {
@@ -403,23 +488,48 @@ public:
     sandbox_client->async_call("free", p);
   }
 
+  // Cast an int64 wire slot back into the callback's expected Nth argument
+  // type.  Pointer args arrive as sandbox offsets — the sandbox_callback_
+  // interceptor on the rlbox side expects T_PointerType for those, so we
+  // forward the offset unchanged.
+  template<typename A>
+  static A unpack_slot(int64_t raw)
+  {
+    if constexpr (std::is_pointer_v<A>) {
+      return reinterpret_cast<A>(static_cast<uintptr_t>(raw));
+    } else {
+      return static_cast<A>(raw);
+    }
+  }
+
+  template<typename T_Ret, typename... T_Args, std::size_t... I>
+  static int64_t invoke_callback_unpacked(void* callback,
+                                          const std::vector<int64_t>& args,
+                                          std::index_sequence<I...>)
+  {
+    auto fn = reinterpret_cast<T_Ret (*)(T_Args...)>(callback);
+    if constexpr (std::is_void_v<T_Ret>) {
+      fn(unpack_slot<T_Args>(args[I])...);
+      return 0;
+    } else if constexpr (std::is_pointer_v<T_Ret>) {
+      T_Ret res = fn(unpack_slot<T_Args>(args[I])...);
+      return static_cast<int64_t>(reinterpret_cast<uintptr_t>(res));
+    } else {
+      T_Ret res = fn(unpack_slot<T_Args>(args[I])...);
+      return static_cast<int64_t>(res);
+    }
+  }
+
   template<typename T_Ret, typename... T_Args>
   inline T_PointerType impl_register_callback(void* key, void* callback)
   {
     {
       std::lock_guard<std::mutex> lock(callback_mutex);
       callback_map[reinterpret_cast<uintptr_t>(key)] =
-        [callback](clmdep_msgpack::object params) -> clmdep_msgpack::object {
-        auto args = params.as<std::tuple<T_Args...>>();
-        if constexpr (std::is_void_v<T_Ret>) {
-          std::apply(reinterpret_cast<T_Ret (*)(T_Args...)>(callback), args);
-          return clmdep_msgpack::object();
-        } else {
-          T_Ret res =
-            std::apply(reinterpret_cast<T_Ret (*)(T_Args...)>(callback), args);
-          return clmdep_msgpack::object(res);
-        }
-      };
+        [callback](const std::vector<int64_t>& args) -> int64_t {
+          return invoke_callback_unpacked<T_Ret, T_Args...>(
+            callback, args, std::index_sequence_for<T_Args...>{});
+        };
     }
 
     if (!sandbox_client) {

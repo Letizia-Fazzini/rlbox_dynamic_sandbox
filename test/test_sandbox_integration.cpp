@@ -4,6 +4,7 @@
 #include <cstring>
 #include <vector>
 
+#include "rlbox_process_abi.hpp"
 #include "rlbox_process_sandbox.hpp"
 #include "rlbox_process_tls.hpp"
 
@@ -42,6 +43,7 @@ public:
   using rlbox_process_sandbox::impl_get_sandboxed_pointer;
   using rlbox_process_sandbox::impl_get_total_memory;
   using rlbox_process_sandbox::impl_get_unsandboxed_pointer;
+  using rlbox_process_sandbox::impl_invoke_with_func_ptr;
   using rlbox_process_sandbox::impl_is_pointer_in_app_memory;
   using rlbox_process_sandbox::impl_is_pointer_in_sandbox_memory;
   using rlbox_process_sandbox::impl_malloc_in_sandbox;
@@ -70,27 +72,26 @@ TEST_CASE("sandbox lifecycle: create then destroy cleanly",
   CHECK(rlbox::detail::thread_local_sandbox == nullptr);
 }
 
-TEST_CASE("sandbox malloc returns an offset inside shared memory",
+TEST_CASE("sandbox malloc returns an address inside shared memory",
           "[sandbox][malloc]")
 {
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
-  auto off = s.impl_malloc_in_sandbox(128);
-  REQUIRE(off != 0);
-  CHECK(off < s.impl_get_total_memory());
+  auto addr = s.impl_malloc_in_sandbox(128);
+  REQUIRE(addr != 0);
 
-  // Translate to a host pointer and verify it's inside our mapped region.
-  void* host_ptr = s.impl_get_unsandboxed_pointer<char>(off);
+  // With same-base mapping the returned sandbox pointer is an absolute
+  // address that also works on the host.  It must fall inside the mapped
+  // region, and host writes through it must be immediately visible.
+  void* host_ptr = s.impl_get_unsandboxed_pointer<char>(addr);
   CHECK(s.impl_is_pointer_in_sandbox_memory(host_ptr));
 
-  // Write through the host pointer — the child will see the same bytes
-  // because the region is MAP_SHARED.
   std::memset(host_ptr, 0xCD, 128);
   CHECK(static_cast<unsigned char*>(host_ptr)[0] == 0xCD);
   CHECK(static_cast<unsigned char*>(host_ptr)[127] == 0xCD);
 
-  s.impl_free_in_sandbox(off);
+  s.impl_free_in_sandbox(addr);
   s.impl_destroy_sandbox();
 }
 
@@ -102,26 +103,31 @@ TEST_CASE("sandbox malloc hands out distinct, non-overlapping regions",
 
   constexpr size_t kN = 8;
   constexpr size_t kSize = 4096;
-  std::vector<uintptr_t> offsets;
-  offsets.reserve(kN);
+  std::vector<uintptr_t> addrs;
+  addrs.reserve(kN);
+  const auto base =
+    reinterpret_cast<uintptr_t>(s.impl_get_memory_location());
+  const auto total = s.impl_get_total_memory();
   for (size_t i = 0; i < kN; ++i) {
-    auto off = s.impl_malloc_in_sandbox(kSize);
-    REQUIRE(off != 0);
-    offsets.push_back(off);
+    auto addr = s.impl_malloc_in_sandbox(kSize);
+    REQUIRE(addr != 0);
+    addrs.push_back(addr);
   }
 
-  // Every offset should be unique and all should fit within total memory.
+  // Every allocation must fit entirely within the shared region and must
+  // not overlap any other.
   for (size_t i = 0; i < kN; ++i) {
-    CHECK(offsets[i] + kSize <= s.impl_get_total_memory());
+    CHECK(addrs[i] >= base);
+    CHECK(addrs[i] + kSize <= base + total);
     for (size_t j = i + 1; j < kN; ++j) {
       bool overlap =
-        !(offsets[i] + kSize <= offsets[j] || offsets[j] + kSize <= offsets[i]);
+        !(addrs[i] + kSize <= addrs[j] || addrs[j] + kSize <= addrs[i]);
       CHECK_FALSE(overlap);
     }
   }
 
-  for (auto off : offsets) {
-    s.impl_free_in_sandbox(off);
+  for (auto addr : addrs) {
+    s.impl_free_in_sandbox(addr);
   }
   s.impl_destroy_sandbox();
 }
@@ -170,63 +176,74 @@ TEST_CASE("invoke executes a simple C function via libffi in the child",
   auto encoded = lookup.as<uintptr_t>();
   REQUIRE(encoded != 0);
 
-  // The shim's invoke handler is bound as
-  //     (uintptr_t func_offset, std::vector<int64_t> args)
-  // so we must call it with exactly that argument shape.  The public
-  // impl_invoke_with_func_ptr wrapper currently forwards params as a
-  // parameter pack instead of packing them into a vector; we exercise the
-  // handler directly here to validate the shim's RPC layer independent of
-  // that wrapper.
-  std::vector<int64_t> args = { 7, 35 };
-  auto result = s.raw_client()->call("invoke", encoded, args);
+  // New typed schema: (func_offset, ret_tag, arg_tags, arg_values).
+  std::vector<int32_t> arg_tags = { rlbox::ARG_SINT64, rlbox::ARG_SINT64 };
+  std::vector<int64_t> arg_values = { 7, 35 };
+  auto result = s.raw_client()->call(
+    "invoke", encoded, (int32_t)rlbox::ARG_SINT64, arg_tags, arg_values);
   CHECK(result.as<int64_t>() == 42);
 
   s.impl_destroy_sandbox();
 }
 
-TEST_CASE("invoke can read/write host-visible shared memory",
+TEST_CASE("invoke writes through a POINTER-tagged arg into shared memory",
           "[sandbox][invoke][memory]")
 {
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
-  // Allocate an int64 inside the sandbox.
-  auto off = s.impl_malloc_in_sandbox(sizeof(int64_t));
-  REQUIRE(off != 0);
+  // Allocate an int64 inside the sandbox and initialize to 0.
+  auto addr = s.impl_malloc_in_sandbox(sizeof(int64_t));
+  REQUIRE(addr != 0);
   auto* host_view = static_cast<int64_t*>(
-    s.impl_get_unsandboxed_pointer<int64_t>(off));
+    s.impl_get_unsandboxed_pointer<int64_t>(addr));
   *host_view = 0;
 
-  // Resolve glue_write_int64.
+  // Resolve glue_write_int64: int64_t(int64_t*, int64_t).
   auto lookup =
     s.raw_client()->call("lookup_symbol", std::string("glue_write_int64"));
   auto encoded = lookup.as<uintptr_t>();
   REQUIRE(encoded != 0);
 
-  // Invoke: the pointer argument must be the *child-side* address, which
-  // for shared memory equals child_shm_base + offset.  The shim
-  // reconstructs the original address by the same rule its lookup_symbol
-  // uses (offset = child_ptr - child_shm_base), so we pass `off` directly.
-  // But `off` here is the host-side sandboxed offset — it matches the
-  // child-side offset because both sides map the same memfd, *but at
-  // potentially different base addresses*.  The shim indexes allocations
-  // as "g_shm_base + offset" when freeing, so we need the child's absolute
-  // address for the pointer arg to glue_write_int64.
-  //
-  // Simplest approach: ask the shim to translate by using a helper that
-  // lives on the child side.  Since we don't have one yet, compute the
-  // child address via a symbol lookup round-trip: we can encode the
-  // pointer as the host offset, and invoke with args = { child_addr, val }
-  // — but we don't know child_shm_base here without exposing it.
-  //
-  // For now, assert that the RPC at least reaches the function.  A full
-  // round-trip pointer test requires the shim to expose its shm base, or
-  // for invoke to accept an "offset + pointer-arg-indices" schema.  See
-  // INTEGRATION-TODO in the repo.
-  SUCCEED("invoke reaches the child; full pointer round-trip awaits a "
-          "shim-side shm-base query");
+  // Send the pointer arg as an ARG_POINTER carrying an absolute address
+  // (same-base mapping makes host and child addresses identical for the
+  // shared region).  The callee writes through the pointer and the host
+  // sees the write immediately via MAP_SHARED.
+  std::vector<int32_t> arg_tags = { rlbox::ARG_POINTER, rlbox::ARG_SINT64 };
+  std::vector<int64_t> arg_values = { static_cast<int64_t>(addr),
+                                      0xDEADBEEFLL };
+  auto result = s.raw_client()->call(
+    "invoke", encoded, (int32_t)rlbox::ARG_SINT64, arg_tags, arg_values);
 
-  s.impl_free_in_sandbox(off);
+  CHECK(result.as<int64_t>() == 0xDEADBEEFLL);
+  CHECK(*host_view == 0xDEADBEEFLL);
+
+  s.impl_free_in_sandbox(addr);
+  s.impl_destroy_sandbox();
+}
+
+TEST_CASE("impl_invoke_with_func_ptr emits typed payload and round-trips",
+          "[sandbox][invoke][typed]")
+{
+  // Exercise the high-level wrapper that derives the typed payload from
+  // the function type T.  This is the path rlbox itself uses.
+  IntegrationHarness s;
+  REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
+
+  auto lookup =
+    s.raw_client()->call("lookup_symbol", std::string("glue_add"));
+  auto encoded = lookup.as<uintptr_t>();
+  REQUIRE(encoded != 0);
+
+  using Func_T = int64_t(int64_t, int64_t);
+  auto* func_ptr = reinterpret_cast<Func_T*>(encoded);
+
+  // T is the original function type.  T_Converted is deduced from the
+  // func_ptr argument; T_Args are deduced from the call site.
+  int64_t out = s.template impl_invoke_with_func_ptr<Func_T>(
+    func_ptr, int64_t{ 100 }, int64_t{ 23 });
+  CHECK(out == 123);
+
   s.impl_destroy_sandbox();
 }
 

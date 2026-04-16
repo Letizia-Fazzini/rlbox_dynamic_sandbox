@@ -32,7 +32,7 @@ FetchContent_MakeAvailable(rlbox)
 
 add_library(rlbox_dynamic INTERFACE)
 target_include_directories(rlbox_dynamic INTERFACE
-                           ${CMAKE_SOURCE_DIR}/include
+                           ${CMAKE_CURRENT_SOURCE_DIR}/include
                            ${rlbox_SOURCE_DIR}/code/include)
 target_link_libraries(rlbox_dynamic INTERFACE rpc)
 
@@ -91,7 +91,7 @@ add_library(sandbox_shim SHARED
             src/rlbox_process_tls.cpp
             $<TARGET_OBJECTS:dlmalloc_mspace>)
 target_include_directories(sandbox_shim PRIVATE
-                           ${CMAKE_SOURCE_DIR}/include
+                           ${CMAKE_CURRENT_SOURCE_DIR}/include
                            ${LIBFFI_INCLUDE_DIR})
 target_link_libraries(sandbox_shim PRIVATE rpc dl pthread ${LIBFFI_LIBRARY})
 set_target_properties(sandbox_shim PROPERTIES
@@ -116,7 +116,7 @@ if(RLBOX_DYNAMIC_BUILD_TESTS)
                  c_src/process_sandbox_wrapper.c
                  test/glue_lib.c)
   target_include_directories(test_sandbox_wrapper PRIVATE
-                             ${CMAKE_SOURCE_DIR}/test)
+                             ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_options(test_sandbox_wrapper PRIVATE "-rdynamic")
 
   add_executable(test_process_sandbox
@@ -126,7 +126,7 @@ if(RLBOX_DYNAMIC_BUILD_TESTS)
                  test/test_sandbox_integration.cpp
                  src/rlbox_process_tls.cpp)
   target_include_directories(test_process_sandbox PRIVATE
-                             ${CMAKE_SOURCE_DIR}/test
+                             ${CMAKE_CURRENT_SOURCE_DIR}/test
                              ${catch2_SOURCE_DIR}/single_include)
   target_link_libraries(test_process_sandbox PRIVATE
                         rlbox_dynamic

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <ffi.h>
 #include <mutex>
 #include <stdio.h>
@@ -10,6 +11,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+#include "rlbox_process_abi.hpp"
 #include "rpc/client.h"
 #include "rpc/server.h"
 
@@ -39,16 +41,26 @@ static void init_shm()
   g_in_init = true;
   const char* fd_env = getenv("RLBOX_SHM_FD");
   const char* size_env = getenv("RLBOX_SHM_SIZE");
+  const char* base_env = getenv("RLBOX_SHM_BASE");
 
-  if (fd_env && size_env) {
+  if (fd_env && size_env && base_env) {
     int fd = atoi(fd_env);
     g_shm_size = atoll(size_env);
-    // Map the shared memory into the child process
-    g_shm_base =
-      mmap(NULL, g_shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (g_shm_base == MAP_FAILED) {
+    uintptr_t want_base = (uintptr_t)strtoull(base_env, nullptr, 10);
+    // Map the memfd at the *same* virtual address the host chose.  This
+    // is what keeps pointers consistent: native C code running in the
+    // child can write absolute pointers into shared-memory structs and
+    // the host reads them back as valid host addresses.  MAP_FIXED_NOREPLACE
+    // fails (instead of silently overwriting) if something is already
+    // mapped at that range.
+    int flags = MAP_SHARED | MAP_FIXED_NOREPLACE;
+    void* want_addr = (void*)want_base;
+    void* got = mmap(
+      want_addr, g_shm_size, PROT_READ | PROT_WRITE, flags, fd, 0);
+    if (got == MAP_FAILED || got != want_addr) {
       g_shm_base = NULL;
     } else {
+      g_shm_base = got;
       // Initialize dlmalloc mspace. Set locked=1 to ensure thread safety
       // between the RPC server thread and the library main thread.
       g_mspace = create_mspace_with_base(g_shm_base, g_shm_size, 1);
@@ -208,19 +220,18 @@ static void start_rpc_server()
 
   rpc::server srv(port);
 
-  // Handler for symbol lookup
+  // Handler for symbol lookup.  The returned address is absolute: the
+  // host shares the child's VA for shared memory and treats function
+  // addresses as raw pointers, which it hands back unchanged in invoke.
   srv.bind("lookup_symbol", [](std::string name) {
     void* ptr = dlsym(RTLD_DEFAULT, name.c_str());
-    if (!ptr || !g_shm_base)
-      return (uintptr_t)0;
-    // Return as offset for RLBox pointer translation
-    return (uintptr_t)ptr - (uintptr_t)g_shm_base;
+    return (uintptr_t)ptr;
   });
 
   // Handler for memory allocation.  Reject any pointer outside the shared
   // region — dlmalloc with HAVE_MMAP can satisfy huge requests via its
   // own mmap path, which would land outside the mspace and be unreachable
-  // from the host.
+  // from the host.  Returns the absolute address (same on both sides).
   srv.bind("malloc", [](size_t size) {
     void* ptr = malloc(size);
     if (!ptr || !g_shm_base) {
@@ -232,81 +243,156 @@ static void start_rpc_server()
       free(ptr);
       return (uintptr_t)0;
     }
-    return p - base;
+    return p;
   });
 
   // Handler for freeing memory
-  srv.bind("free", [](uintptr_t offset) {
-    if (g_shm_base && offset != 0) {
-      free((char*)g_shm_base + offset);
+  srv.bind("free", [](uintptr_t abs_addr) {
+    if (abs_addr != 0) {
+      free((void*)abs_addr);
     }
   });
 
-  // Handler for function invocation
-  srv.bind("invoke", [](uintptr_t func_offset, std::vector<int64_t> args) {
-    if (!g_shm_base)
-      return (int64_t)0;
+  // Map a wire arg_type tag to its libffi type and the storage width the
+  // slot occupies on the call frame.  Returns NULL if the tag is unknown.
+  auto ffi_type_for_tag = [](int32_t tag) -> ffi_type* {
+    switch (tag) {
+      case rlbox::ARG_VOID:   return &ffi_type_void;
+      case rlbox::ARG_SINT32: return &ffi_type_sint32;
+      case rlbox::ARG_UINT32: return &ffi_type_uint32;
+      case rlbox::ARG_SINT64: return &ffi_type_sint64;
+      case rlbox::ARG_UINT64: return &ffi_type_uint64;
+      case rlbox::ARG_POINTER: return &ffi_type_pointer;
+      default: return nullptr;
+    }
+  };
 
-    void* func_ptr = (char*)g_shm_base + func_offset;
-    size_t nargs = args.size();
+  // Handler for function invocation.
+  //
+  // Wire schema:
+  //   func_addr  : uintptr_t           -- absolute address of the function
+  //   ret_tag    : int32_t             -- arg_type for the return slot
+  //   arg_tags   : vector<int32_t>     -- one arg_type per argument
+  //   arg_values : vector<int64_t>     -- widened int64 slot per argument
+  //
+  // POINTER-tagged args carry absolute addresses on the wire (host and
+  // child share the VA range for shared memory).  The scratch storage for
+  // those pointers lives in a parallel vector because ffi_call reads each
+  // arg through a void*.
+  srv.bind("invoke",
+           [ffi_type_for_tag](uintptr_t func_addr,
+                              int32_t ret_tag,
+                              std::vector<int32_t> arg_tags,
+                              std::vector<int64_t> arg_values) -> int64_t {
+    if (!g_shm_base || !func_addr) {
+      return 0;
+    }
+    if (arg_tags.size() != arg_values.size()) {
+      return 0;
+    }
 
-    // Prepare FFI types and values
-    std::vector<ffi_type*> types(nargs, &ffi_type_sint64);
-    std::vector<void*> values(nargs);
+    void* func_ptr = (void*)func_addr;
+    size_t nargs = arg_tags.size();
+
+    std::vector<ffi_type*> types(nargs, nullptr);
+    std::vector<void*> values(nargs, nullptr);
+    // Scratch storage for pointer args.  libffi reads each arg through a
+    // void*, so we need stable backing storage per slot.
+    std::vector<void*> ptr_storage(nargs, nullptr);
+
     for (size_t i = 0; i < nargs; ++i) {
-      values[i] = &args[i];
+      ffi_type* t = ffi_type_for_tag(arg_tags[i]);
+      if (!t || arg_tags[i] == rlbox::ARG_VOID) {
+        return 0;
+      }
+      types[i] = t;
+      if (arg_tags[i] == rlbox::ARG_POINTER) {
+        ptr_storage[i] = (void*)(uintptr_t)arg_values[i];
+        values[i] = &ptr_storage[i];
+      } else {
+        values[i] = &arg_values[i];
+      }
+    }
+
+    ffi_type* ret_ffi_type = ffi_type_for_tag(ret_tag);
+    if (!ret_ffi_type) {
+      return 0;
     }
 
     ffi_cif cif;
-    if (ffi_prep_cif(
-          &cif, FFI_DEFAULT_ABI, nargs, &ffi_type_sint64, types.data()) ==
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, nargs, ret_ffi_type, types.data()) !=
         FFI_OK) {
-
-      int pipefd[2];
-      if (pipe(pipefd) == -1) {
-        return (int64_t)0;
-      }
-
-      pid_t pid = fork();
-      if (pid == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return (int64_t)0;
-      }
-
-      if (pid == 0) {
-        // Isolated Child Process
-        close(pipefd[0]);
-        int64_t child_rc = 0;
-        ffi_call(&cif, FFI_FN(func_ptr), &child_rc, values.data());
-        ssize_t written = write(pipefd[1], &child_rc, sizeof(child_rc));
-        (void)written;
-        close(pipefd[1]);
-        _exit(0);
-      } else {
-        // RPC Server Thread (Parent)
-        close(pipefd[1]);
-        int64_t parent_rc = 0;
-        int status;
-        // Read result from child
-        if (read(pipefd[0], &parent_rc, sizeof(parent_rc)) <= 0) {
-            parent_rc = 0; // Child likely crashed or failed to write
-        }
-        close(pipefd[0]);
-        waitpid(pid, &status, 0);
-        return parent_rc;
-      }
+      return 0;
     }
-    return (int64_t)0;
+
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+      return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+      close(pipefd[0]);
+      close(pipefd[1]);
+      return 0;
+    }
+
+    if (pid == 0) {
+      // Isolated callee child.
+      close(pipefd[0]);
+      // libffi writes the return value into a slot of "rtype_sized" bytes,
+      // but for our wire representation we always carry an int64 back.
+      // A ffi_arg-sized buffer is the portable landing pad for sub-64-bit
+      // return widths; zero-initialize so unused bits are defined.
+      ffi_arg ret_buf = 0;
+      if (ret_tag == rlbox::ARG_VOID) {
+        ffi_call(&cif, FFI_FN(func_ptr), nullptr, values.data());
+      } else {
+        ffi_call(&cif, FFI_FN(func_ptr), &ret_buf, values.data());
+      }
+
+      int64_t child_rc = 0;
+      switch (ret_tag) {
+        case rlbox::ARG_VOID:   child_rc = 0; break;
+        case rlbox::ARG_SINT32: child_rc = (int64_t)(int32_t)ret_buf; break;
+        case rlbox::ARG_UINT32: child_rc = (int64_t)(uint32_t)ret_buf; break;
+        case rlbox::ARG_SINT64: child_rc = (int64_t)ret_buf; break;
+        case rlbox::ARG_UINT64: child_rc = (int64_t)(uint64_t)ret_buf; break;
+        case rlbox::ARG_POINTER: {
+          // Pointer return flows back as an absolute address, which the
+          // host can dereference directly thanks to same-base mapping.
+          void* p = *(void**)&ret_buf;
+          child_rc = (int64_t)(uintptr_t)p;
+          break;
+        }
+      }
+
+      ssize_t written = write(pipefd[1], &child_rc, sizeof(child_rc));
+      (void)written;
+      close(pipefd[1]);
+      _exit(0);
+    } else {
+      // RPC thread (parent of the callee fork).
+      close(pipefd[1]);
+      int64_t parent_rc = 0;
+      int status;
+      if (read(pipefd[0], &parent_rc, sizeof(parent_rc)) <= 0) {
+        parent_rc = 0;
+      }
+      close(pipefd[0]);
+      waitpid(pid, &status, 0);
+      return parent_rc;
+    }
   });
 
-  // Handler for callback registration
+  // Handler for callback registration.  Returns the trampoline's absolute
+  // address — the host uses it as a T_PointerType which the sandboxed
+  // library then calls directly.
   srv.bind("register_callback", [](uintptr_t host_key) {
     for (size_t i = 0; i < k_callback_slots; ++i) {
       if (g_callback_keys[i] == 0) {
         g_callback_keys[i] = host_key;
-        void* t_addr = g_trampoline_table[i];
-        return (uintptr_t)t_addr - (uintptr_t)g_shm_base;
+        return (uintptr_t)g_trampoline_table[i];
       }
     }
     return (uintptr_t)0;
