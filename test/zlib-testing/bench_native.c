@@ -86,6 +86,6 @@ int main(int argc, char const* argv[])
   fclose(source);
   fclose(dest);
 
-  printf("NATIVE_MS=%.3f\n", elapsed_ms);
+  printf("COMPRESSION_MS=%.3f\n", elapsed_ms);
   return 0;
 }
