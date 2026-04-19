@@ -58,39 +58,14 @@ int main(int argc, char const *argv[]) {
   unsigned char in[CHUNK];
   //unsigned char out[CHUNK];
 
-  //baseline variables
-  FILE* Bsource = fopen("pi.txt","r");
-  FILE* Bdest = fopen("compressed_baseline.txt", "w");
-  int  Bflush, Bret;
-  unsigned Bhave;
-  z_stream Bstrm;
-  unsigned char Bin[CHUNK];
-  unsigned char Bout[CHUNK];
-
   int level = 2;
   if(argc>1) {
     level = std::stoi(argv[1]);
-  }  
-
-  //test sandbox with version
-  /*
-  tainted<const char*, rlbox_wasm2c_sandbox> version = sandbox.invoke_sandbox_function(zlibVersion);
-  std::unique_ptr<char[]> checked_version =
-    version.copy_and_verify_string([](std::unique_ptr<char[]> val) {
-        return move(val);
-    });
-  printf("sandbox version: %s\n", checked_version.get());
-  printf("outside version: %s\n", zlibVersion());
-  */
+  }
 
   initStream.zalloc = Z_NULL;
   initStream.zfree = Z_NULL;
   initStream.opaque = Z_NULL;
-
-  //baseline
-  Bstrm.zalloc = Z_NULL;
-  Bstrm.zfree = Z_NULL;
-  Bstrm.opaque = Z_NULL;
 
   //sandbox init
   auto sandboxedStream = sandbox.malloc_in_sandbox<z_stream>();
@@ -106,16 +81,10 @@ int main(int argc, char const *argv[]) {
     return Z_ERRNO;
   }
 
-  //baseline init
-  Bret = deflateInit(&Bstrm, level);
-  if (Bret != Z_OK){
-    return Z_ERRNO;
-  } 
-
   auto verifiedAvailOut = 0;
   auto verifiedDeflateRet = Z_OK;
 
-  double t_sandbox_ms = 0.0, t_native_ms = 0.0, t0;
+  double t_sandbox_ms = 0.0, t0;
 
   /* compress until end of file */
   do {
@@ -139,15 +108,6 @@ int main(int argc, char const *argv[]) {
     }
     sandboxedStream->next_in = sandboxedIn;
     t_sandbox_ms += monotonic_ms() - t0;
-
-    //baseline
-    Bstrm.avail_in = fread(Bin, 1, CHUNK, Bsource);
-    if (ferror(Bsource)) {
-        (void)deflateEnd(&Bstrm);
-        return Z_ERRNO;
-    }
-    Bflush = feof(Bsource) ? Z_FINISH : Z_NO_FLUSH;
-    Bstrm.next_in = Bin;
 
     /* run deflate() on input until output buffer not full, finish
         compression if all of source has been read in */
@@ -187,21 +147,6 @@ int main(int argc, char const *argv[]) {
       }
       t_sandbox_ms += monotonic_ms() - t0;
 
-      //baseline
-      t0 = monotonic_ms();
-      Bstrm.avail_out = CHUNK;
-      Bstrm.next_out = Bout;
-      Bret = deflate(&Bstrm, Bflush);    /* no bad return value */
-      assert(Bret != Z_STREAM_ERROR);  /* state not clobbered */
-      Bhave = CHUNK - Bstrm.avail_out;
-      if (fwrite(Bout, 1, Bhave, Bdest) != Bhave || ferror(Bdest)) {
-        (void)deflateEnd(&Bstrm);
-        return Z_ERRNO;
-      }
-      t_native_ms += monotonic_ms() - t0;
-
-      assert(verifiedAvailOut == Bstrm.avail_out); //check baseline matches
-
     } while (verifiedAvailOut == 0);
 
     t0 = monotonic_ms();
@@ -215,27 +160,17 @@ int main(int argc, char const *argv[]) {
     assert(verifiedAvailIn == 0);     /* all input will be used */
     t_sandbox_ms += monotonic_ms() - t0;
 
-    //baseline
-    assert(Bstrm.avail_in == 0);
-
-    assert(Bflush == flush); //check baseline matches
-
   /* done when last data in file processed */
   } while (flush != Z_FINISH);
 
   //sandbox
   assert(verifiedDeflateRet == Z_STREAM_END); /* stream will be complete */
 
-  //baseline
-  assert(Bret == Z_STREAM_END);
-
   // destroy sandbox
   sandbox.destroy_sandbox();
 
-  printf("SANDBOX_MS=%.3f NATIVE_MS=%.3f\n", t_sandbox_ms, t_native_ms);
+  printf("COMPRESSION_MS=%.3f\n", t_sandbox_ms);
 
   return 0;
-
-  
 }
 

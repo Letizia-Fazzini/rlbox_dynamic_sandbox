@@ -19,7 +19,7 @@ static double monotonic_ms()
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
 
 // Process sandbox uses dynamic symbol resolution via dlsym in the child —
-// no RLBOX_USE_STATIC_CALLS() define.
+// no RLBOX_USE_STATIC_CALLS()
 
 #include "rlbox.hpp"
 #include "rlbox_process_sandbox.hpp"
@@ -51,14 +51,6 @@ int main(int argc, char const *argv[]) {
   z_stream initStream;
   unsigned char in[CHUNK];
 
-  FILE* Bsource = fopen("pi.txt","r");
-  FILE* Bdest = fopen("compressed_baseline.txt", "w");
-  int  Bflush, Bret;
-  unsigned Bhave;
-  z_stream Bstrm;
-  unsigned char Bin[CHUNK];
-  unsigned char Bout[CHUNK];
-
   int level = 2;
   if(argc>1) {
     level = std::stoi(argv[1]);
@@ -67,10 +59,6 @@ int main(int argc, char const *argv[]) {
   initStream.zalloc = Z_NULL;
   initStream.zfree = Z_NULL;
   initStream.opaque = Z_NULL;
-
-  Bstrm.zalloc = Z_NULL;
-  Bstrm.zfree = Z_NULL;
-  Bstrm.opaque = Z_NULL;
 
   auto sandboxedStream = sandbox.malloc_in_sandbox<z_stream>();
   rlbox::memcpy(sandbox, sandboxedStream, &initStream, sizeof(z_stream));
@@ -86,15 +74,10 @@ int main(int argc, char const *argv[]) {
     return Z_ERRNO;
   }
 
-  Bret = deflateInit(&Bstrm, level);
-  if (Bret != Z_OK){
-    return Z_ERRNO;
-  }
-
   auto verifiedAvailOut = 0;
   auto verifiedDeflateRet = Z_OK;
 
-  double t_sandbox_ms = 0.0, t_native_ms = 0.0, t0;
+  double t_sandbox_ms = 0.0, t0;
 
   do {
     auto in_size = fread(in, 1, CHUNK, source);
@@ -116,14 +99,6 @@ int main(int argc, char const *argv[]) {
     }
     sandboxedStream->next_in = sandboxedIn;
     t_sandbox_ms += monotonic_ms() - t0;
-
-    Bstrm.avail_in = fread(Bin, 1, CHUNK, Bsource);
-    if (ferror(Bsource)) {
-        (void)deflateEnd(&Bstrm);
-        return Z_ERRNO;
-    }
-    Bflush = feof(Bsource) ? Z_FINISH : Z_NO_FLUSH;
-    Bstrm.next_in = Bin;
 
     do {
       t0 = monotonic_ms();
@@ -160,20 +135,6 @@ int main(int argc, char const *argv[]) {
       }
       t_sandbox_ms += monotonic_ms() - t0;
 
-      t0 = monotonic_ms();
-      Bstrm.avail_out = CHUNK;
-      Bstrm.next_out = Bout;
-      Bret = deflate(&Bstrm, Bflush);
-      assert(Bret != Z_STREAM_ERROR);
-      Bhave = CHUNK - Bstrm.avail_out;
-      if (fwrite(Bout, 1, Bhave, Bdest) != Bhave || ferror(Bdest)) {
-        (void)deflateEnd(&Bstrm);
-        return Z_ERRNO;
-      }
-      t_native_ms += monotonic_ms() - t0;
-
-      assert(verifiedAvailOut == Bstrm.avail_out);
-
     } while (verifiedAvailOut == 0);
 
     t0 = monotonic_ms();
@@ -186,18 +147,13 @@ int main(int argc, char const *argv[]) {
     assert(verifiedAvailIn == 0);
     t_sandbox_ms += monotonic_ms() - t0;
 
-    assert(Bstrm.avail_in == 0);
-
-    assert(Bflush == flush);
-
   } while (flush != Z_FINISH);
 
   assert(verifiedDeflateRet == Z_STREAM_END);
-  assert(Bret == Z_STREAM_END);
 
   sandbox.destroy_sandbox();
 
-  printf("SANDBOX_MS=%.3f NATIVE_MS=%.3f\n", t_sandbox_ms, t_native_ms);
+  printf("COMPRESSION_MS=%.3f\n", t_sandbox_ms);
 
   return 0;
 }

@@ -5,12 +5,10 @@ Drive the zlib benchmark across three backends:
     - wasm2c:  test/zlib-testing/build/main (RLBox wasm2c sandbox)
     - process: test/zlib-testing/build/main_process (this repo's process sandbox)
 
-Each backend's main runs the zlib compression loop and prints a line like
-    SANDBOX_MS=12.345 NATIVE_MS=11.222
-(for the sandbox mains) or
-    NATIVE_MS=11.222
-(for bench_native). We parse that, plus the Python wall-clock wrapper, and
-record everything to a CSV for plotting.
+Each binary runs the zlib compression loop and prints a line like
+    COMPRESSION_MS=12.345
+We parse that, plus the Python wall-clock wrapper, and record everything to a
+CSV for plotting.
 
 The sandbox mains hard-code 'pi.txt' as the input file and './sandbox_shim.so'
 as the shim preload path. So we run each binary from the build directory and
@@ -44,8 +42,7 @@ DEFAULT_PROCESS_BUILDS = [
     ("process_capnp", "build_capnp"),
 ]
 
-SANDBOX_RE = re.compile(r"SANDBOX_MS=([\d.]+)")
-NATIVE_RE = re.compile(r"NATIVE_MS=([\d.]+)")
+COMPRESSION_RE = re.compile(r"COMPRESSION_MS=([\d.]+)")
 
 
 def parse_sizes(s: str) -> list[int]:
@@ -67,15 +64,11 @@ def parse_ints(s: str) -> list[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
-def ensure_bench_native() -> Path:
-    """Build bench_native if the binary is missing or stale."""
-    binary = BENCH_DIR / "bench_native"
-    src = BENCH_DIR / "bench_native.c"
-    if not binary.exists() or binary.stat().st_mtime < src.stat().st_mtime:
-        print("[bench] building bench_native...", file=sys.stderr)
-        subprocess.run(
-            ["make", "-C", str(BENCH_DIR), "bench_native"], check=True
-        )
+def ensure_bench_native(build_dir: Path) -> Path:
+    binary = build_dir / "bench_native"
+    if not binary.exists():
+        print(f"[bench] {binary} missing; rebuild with cmake", file=sys.stderr)
+        sys.exit(1)
     return binary
 
 
@@ -99,13 +92,9 @@ def run_once(cmd: list[str], cwd: Path) -> tuple[float, str]:
     return wall_ms, res.stdout
 
 
-def parse_timing(stdout: str) -> tuple[Optional[float], Optional[float]]:
-    sm = SANDBOX_RE.search(stdout)
-    nm = NATIVE_RE.search(stdout)
-    return (
-        float(sm.group(1)) if sm else None,
-        float(nm.group(1)) if nm else None,
-    )
+def parse_timing(stdout: str) -> Optional[float]:
+    m = COMPRESSION_RE.search(stdout)
+    return float(m.group(1)) if m else None
 
 
 def run_config(
@@ -123,7 +112,7 @@ def run_config(
     rows = []
     for i in range(iters):
         wall_ms, stdout = run_once(cmd, cwd)
-        sandbox_ms, native_ms = parse_timing(stdout)
+        compression_ms = parse_timing(stdout)
         rows.append(
             dict(
                 backend=backend,
@@ -131,8 +120,7 @@ def run_config(
                 level=level,
                 iter=i,
                 wall_ms=wall_ms,
-                sandbox_ms=sandbox_ms,
-                native_ms=native_ms,
+                compression_ms=compression_ms,
             )
         )
     return rows
@@ -169,7 +157,7 @@ def main() -> int:
                     help="comma-separated process variants to drive, "
                          "either `label:path` or `subdir` (resolved under "
                          "test/zlib-testing).  Default: rpclib + capnp.")
-    ap.add_argument("--sizes", type=str, default="256k,1m,4m,16m",
+    ap.add_argument("--sizes", type=str, default="256k,1m,4m",
                     help="input sizes, comma-separated; k/m suffixes ok")
     ap.add_argument("--levels", type=str, default="1,6,9",
                     help="compression levels, comma-separated")
@@ -219,7 +207,7 @@ def main() -> int:
         print("[bench] nothing to do — all backends disabled", file=sys.stderr)
         return 1
 
-    bench_native = ensure_bench_native()
+    bench_native = ensure_bench_native(wasm2c_build_dir)
 
     # Save the original pi.txt for each build dir we'll be writing to so we
     # can restore them all after benchmarking.
@@ -290,7 +278,7 @@ def main() -> int:
         print("[bench] restored pi.txt files", file=sys.stderr)
 
     # Write CSV.
-    fields = ["backend", "size_bytes", "level", "iter", "wall_ms", "sandbox_ms", "native_ms"]
+    fields = ["backend", "size_bytes", "level", "iter", "wall_ms", "compression_ms"]
     with open(args.out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
@@ -305,18 +293,13 @@ def main() -> int:
     for r in all_rows:
         by_key.setdefault(key(r), []).append(r)
 
-    print("\nbackend          size       level   metric        median_ms", file=sys.stderr)
-    print("-" * 72, file=sys.stderr)
+    print("\nbackend          size       level   median_compression_ms", file=sys.stderr)
+    print("-" * 60, file=sys.stderr)
     for k in sorted(by_key.keys()):
         rows = by_key[k]
         backend, size_bytes, level = k
-        if backend == "native":
-            t = statistics.median(r["native_ms"] for r in rows)
-            metric = "native"
-        else:
-            t = statistics.median(r["sandbox_ms"] for r in rows)
-            metric = "sandbox"
-        print(f"{backend:<16} {size_bytes:<10} {level:<7} {metric:<12} {t:>10.2f}",
+        t = statistics.median(r["compression_ms"] for r in rows)
+        print(f"{backend:<16} {size_bytes:<10} {level:<7} {t:>10.2f}",
               file=sys.stderr)
 
     return 0

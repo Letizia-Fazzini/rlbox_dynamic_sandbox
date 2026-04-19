@@ -91,26 +91,17 @@ def load_rows(path: Path) -> list[dict]:
                     level=int(row["level"]),
                     iter=int(row["iter"]),
                     wall_ms=float(row["wall_ms"]),
-                    sandbox_ms=float(row["sandbox_ms"]) if row["sandbox_ms"] else None,
-                    native_ms=float(row["native_ms"]) if row["native_ms"] else None,
+                    compression_ms=float(row["compression_ms"]) if row["compression_ms"] else None,
                 )
             )
     return rows
 
 
-def primary_ms(row: dict) -> float:
-    """Time number to chart for this row (sandbox time for sandboxes, native
-    time for the native backend)."""
-    if row["backend"] == "native":
-        return row["native_ms"]
-    return row["sandbox_ms"]
-
-
 def medians(rows: list[dict]) -> dict:
-    """Map (backend, size, level) -> median primary_ms."""
+    """Map (backend, size, level) -> median compression_ms."""
     buckets = defaultdict(list)
     for r in rows:
-        v = primary_ms(r)
+        v = r["compression_ms"]
         if v is None:
             continue
         buckets[(r["backend"], r["size_bytes"], r["level"])].append(v)
