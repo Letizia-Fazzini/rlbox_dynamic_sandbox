@@ -19,8 +19,9 @@ option(RLBOX_DYNAMIC_BUILD_TESTS "Build unit + integration tests" ON)
 # a small, dependency-light baseline (msgpack + asio over TCP loopback).  capnp
 # swaps in Cap'n Proto serialization over Unix abstract sockets — fewer bytes
 # on the wire, no event-loop wrapper, and no localhost TCP setup cost.
-set(RLBOX_TRANSPORT "rpclib" CACHE STRING
-    "Wire transport for host<->shim RPC: rpclib | capnp")
+set(RLBOX_TRANSPORT "capnp" CACHE STRING
+    "Wire transport for host<->shim RPC: rpclib | capnp (capnp is the default;
+    rpclib remains a supported build but is not included in standard benchmarks)")
 set_property(CACHE RLBOX_TRANSPORT PROPERTY STRINGS rpclib capnp)
 
 if(NOT RLBOX_TRANSPORT STREQUAL "rpclib" AND

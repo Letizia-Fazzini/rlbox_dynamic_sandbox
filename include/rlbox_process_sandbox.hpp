@@ -210,7 +210,17 @@ protected:
             }
           }
           if (dispatcher) {
+            // Publish (this, key) so the user-registered interceptor —
+            // which runs inside dispatcher() — can recover its context
+            // through impl_get_executed_callback_sandbox_and_key().
+            // Callback dispatch runs on a dedicated host-side thread
+            // (this loop), distinct from the invoker's thread, so the
+            // meta-sandbox's own TLS approach wouldn't reach here.
+            detail::thread_local_sandbox = this;
+            detail::thread_local_callback_key = reinterpret_cast<void*>(key);
             result = dispatcher(args);
+            detail::thread_local_sandbox = nullptr;
+            detail::thread_local_callback_key = nullptr;
           }
           capnp::MallocMessageBuilder out_msg;
           out_msg.initRoot<wire::CallbackResponse>().setResult(result);
@@ -224,6 +234,12 @@ protected:
   }
 #endif
 
+public:
+  // Public because the meta-sandbox (rlbox_meta_sandbox) needs to forward
+  // impl_lookup_symbol through from a non-friend composition.  The other
+  // impl_* methods are already public; this one was historically protected
+  // by oversight — rlbox accesses it via the T_Sbx template where access
+  // control doesn't prevent member access from instantiation sites.
   void* impl_lookup_symbol(const char* func_name)
   {
 #if defined(RLBOX_TRANSPORT_RPCLIB)
@@ -246,6 +262,7 @@ protected:
 #endif
   }
 
+protected:
 #if defined(RLBOX_TRANSPORT_RPCLIB)
   void start_callback_server(uint16_t port)
   {
@@ -263,7 +280,15 @@ protected:
           }
         }
         if (dispatcher) {
-          return dispatcher(args);
+          // Parallel to the capnp path: publish (this, key) for the
+          // interceptor to recover via
+          // impl_get_executed_callback_sandbox_and_key.
+          detail::thread_local_sandbox = this;
+          detail::thread_local_callback_key = reinterpret_cast<void*>(key);
+          int64_t res = dispatcher(args);
+          detail::thread_local_sandbox = nullptr;
+          detail::thread_local_callback_key = nullptr;
+          return res;
         }
         return 0;
       });
@@ -758,6 +783,31 @@ public:
     });
     return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
 #endif
+  }
+
+  // rlbox's `sandbox_callback_interceptor` calls this when a
+  // registered host callback fires, so it can recover (sandbox*, key)
+  // — the key is the user's original function-pointer, which rlbox
+  // reinterprets back into a typed function in the interceptor body.
+  //
+  // Source of truth is the TLS pair published by the dispatch loop
+  // right before it runs the interceptor — see the callback_loop
+  // (capnp) / trigger_callback bind (rpclib).  Guarded on the *key*
+  // being set rather than the sandbox pointer, because
+  // `thread_local_sandbox` is also set in `impl_create_sandbox` on
+  // whichever thread stood the sandbox up (legacy marker from the
+  // original design).  Returns nulls when called outside an active
+  // callback — a composing layer (rlbox_meta_sandbox) uses that null
+  // return as the "process wasn't the one who fired" signal to fall
+  // through to the wasm backend.
+  static inline std::pair<rlbox_process_sandbox*, void*>
+  impl_get_executed_callback_sandbox_and_key()
+  {
+    if (detail::thread_local_callback_key == nullptr) {
+      return { nullptr, nullptr };
+    }
+    return { detail::thread_local_sandbox,
+             detail::thread_local_callback_key };
   }
 
   template<typename T_Ret, typename... T_Args>

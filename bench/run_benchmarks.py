@@ -36,12 +36,12 @@ ZLIB_TESTING_DIR = REPO_ROOT / "test" / "zlib-testing"
 DEFAULT_BUILD_DIR = ZLIB_TESTING_DIR / "build"
 
 # Process-backend variants we'll drive when --process-builds is left at the
-# default.  Each entry is (label, build-subdir-name); the build dir defaults
-# to test/zlib-testing/<subdir>.  Adding a new transport is one line here +
-# a corresponding cmake build dir.
+# default.  Capnp is the default transport — rpclib is still available
+# (the CMake RLBOX_TRANSPORT flag still selects it, build_rpclib/ can
+# still be configured) but not included in standard results.  Override
+# with --process-builds=rpclib:build_rpclib to include it explicitly.
 DEFAULT_PROCESS_BUILDS = [
-    ("process_rpclib", "build_rpclib"),
-    ("process_capnp", "build_capnp"),
+    ("process", "build_capnp"),
 ]
 
 SANDBOX_RE = re.compile(r"SANDBOX_MS=([\d.]+)")
@@ -180,9 +180,28 @@ def main() -> int:
                     help="skip the wasm2c backend (e.g. if not built)")
     ap.add_argument("--no-process", action="store_true",
                     help="skip the process backends entirely")
+    ap.add_argument("--meta-policies", type=str, default="",
+                    help="comma-separated meta-sandbox policies to run; "
+                         "each produces a backend label `meta_<policy>`. "
+                         "Policies: process, wasm, adaptive.  (wasm was "
+                         "previously rejected on zlib; M9 struct-ABI fix "
+                         "landed so it works now.  adaptive uses a tiny "
+                         "adler32 warmup inside main_meta to prime the "
+                         "alloc-routing — see main_meta.cpp.)")
+    ap.add_argument("--meta-build-dir", type=Path,
+                    default=ZLIB_TESTING_DIR / "build_capnp",
+                    help="build dir holding the meta `main_meta` binary "
+                         "(default: %(default)s)")
     args = ap.parse_args()
 
     wasm2c_build_dir = args.wasm2c_build_dir.resolve()
+    meta_build_dir = args.meta_build_dir.resolve()
+    meta_policies = [p.strip() for p in args.meta_policies.split(",") if p.strip()]
+    for p in meta_policies:
+        if p not in ("process", "wasm", "adaptive"):
+            print(f"[bench] --meta-policies rejects '{p}' "
+                  f"(try process, wasm, or adaptive)", file=sys.stderr)
+            return 1
     sizes = parse_sizes(args.sizes)
     levels = parse_ints(args.levels)
 
@@ -223,10 +242,19 @@ def main() -> int:
 
     # Save the original pi.txt for each build dir we'll be writing to so we
     # can restore them all after benchmarking.
+    if meta_policies:
+        main_meta = meta_build_dir / "main_meta"
+        if not main_meta.exists():
+            print(f"[bench] {main_meta} missing; build target main_meta first",
+                  file=sys.stderr)
+            return 1
+
     write_dirs = []
     if not args.no_wasm2c:
         write_dirs.append(wasm2c_build_dir)
     write_dirs.extend(d for _, d in process_builds)
+    if meta_policies and meta_build_dir not in write_dirs:
+        write_dirs.append(meta_build_dir)
     backups: list[tuple[Path, Path]] = []
     seed_bytes: Optional[bytes] = None
     for d in write_dirs:
@@ -278,6 +306,19 @@ def main() -> int:
                         label,
                         [str(build_dir / "main_process"), str(level)],
                         cwd=build_dir,
+                        size=size,
+                        level=level,
+                        iters=args.iters,
+                        warmup=True,
+                    )
+                    all_rows.extend(rows)
+
+                for policy in meta_policies:
+                    rows = run_config(
+                        f"meta_{policy}",
+                        [str(meta_build_dir / "main_meta"),
+                         str(level), policy],
+                        cwd=meta_build_dir,
                         size=size,
                         level=level,
                         iters=args.iters,
