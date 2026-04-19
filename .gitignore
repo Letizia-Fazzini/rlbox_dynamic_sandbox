@@ -2,4 +2,3 @@ build*/
 /target/
 /.vscode/
 wasi-sdk*
-test/libjpeg-testing/
