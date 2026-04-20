@@ -88,6 +88,9 @@
   f(int, progressive_mode, FIELD_NORMAL, ##__VA_ARGS__) g()                     \
   f(int, max_h_samp_factor, FIELD_NORMAL, ##__VA_ARGS__) g()                    \
   f(int, max_v_samp_factor, FIELD_NORMAL, ##__VA_ARGS__) g()                    \
+  /* JPEG_LIB_VERSION >= 70 additions */                                        \
+  f(int, min_DCT_h_scaled_size, FIELD_NORMAL, ##__VA_ARGS__) g()               \
+  f(int, min_DCT_v_scaled_size, FIELD_NORMAL, ##__VA_ARGS__) g()               \
   f(unsigned int, total_iMCU_rows, FIELD_NORMAL, ##__VA_ARGS__) g()             \
   /* per-scan state */                                                           \
   f(int, comps_in_scan, FIELD_NORMAL, ##__VA_ARGS__) g()                        \
@@ -100,6 +103,10 @@
   f(int, Se, FIELD_NORMAL, ##__VA_ARGS__) g()                                   \
   f(int, Ah, FIELD_NORMAL, ##__VA_ARGS__) g()                                   \
   f(int, Al, FIELD_NORMAL, ##__VA_ARGS__) g()                                   \
+  /* JPEG_LIB_VERSION >= 80 additions */                                        \
+  f(int, block_size, FIELD_NORMAL, ##__VA_ARGS__) g()                           \
+  f(const int *, natural_order, FIELD_NORMAL, ##__VA_ARGS__) g()               \
+  f(int, lim_Se, FIELD_NORMAL, ##__VA_ARGS__) g()                              \
   /* compression subobject pointers */                                           \
   f(struct jpeg_comp_master *, master, FIELD_NORMAL, ##__VA_ARGS__) g()         \
   f(struct jpeg_c_main_controller *, main, FIELD_NORMAL, ##__VA_ARGS__) g()     \

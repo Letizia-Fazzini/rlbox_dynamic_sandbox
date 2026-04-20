@@ -249,7 +249,7 @@ def main() -> int:
                     help="comma-separated process variants to drive, "
                          "either `label:path` or `subdir` (resolved under "
                          "test/<library>-testing/).  Default: rpclib + capnp.")
-    ap.add_argument("--sizes", type=str, default="1m",
+    ap.add_argument("--sizes", type=str, default="500k, 1m, 4m",
                     help="input sizes, comma-separated; k/m suffixes ok")
     ap.add_argument("--levels", type=str, default=None,
                     help="compression levels (zlib: 1-9, higher = more compression) or "
@@ -258,7 +258,7 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=3,
                     help="iterations per (backend, size, level)")
     ap.add_argument("--out", type=Path, default=BENCH_DIR / "results.csv")
-    ap.add_argument("--batch-size", type=int, default=64,
+    ap.add_argument("--batch-size", type=int, default=16,
                     help="number of scanlines per jpeg_write_scanlines call "
                          "(default: 64; only used for jpeg)")
     ap.add_argument("--no-wasm2c", action="store_true",
@@ -347,6 +347,18 @@ def main() -> int:
             for level in levels:
                 print(f"[bench] size={size} level={level}", file=sys.stderr)
 
+                for label, build_dir in process_builds:
+                    rows = run_config(
+                        label,
+                        [str(build_dir / "main_process"), str(level)] + extra_args,
+                        cwd=build_dir,
+                        size=size,
+                        level=level,
+                        iters=args.iters,
+                        warmup=True,
+                    )
+                    all_rows.extend(rows)
+
                 # Native reference — runs from whichever dir we picked for
                 # seeding (test_data.txt is identical across them).
                 rows = run_config(
@@ -365,18 +377,6 @@ def main() -> int:
                         "wasm2c",
                         [str(main_bin), str(level)] + extra_args,
                         cwd=wasm2c_build_dir,
-                        size=size,
-                        level=level,
-                        iters=args.iters,
-                        warmup=True,
-                    )
-                    all_rows.extend(rows)
-
-                for label, build_dir in process_builds:
-                    rows = run_config(
-                        label,
-                        [str(build_dir / "main_process"), str(level)] + extra_args,
-                        cwd=build_dir,
                         size=size,
                         level=level,
                         iters=args.iters,

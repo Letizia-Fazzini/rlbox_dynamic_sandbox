@@ -29,9 +29,6 @@ using namespace rlbox;
 
 rlbox_load_structs_from_library(jpeg);
 
-extern "C" void jpeg_report_struct_layout(void);
-extern "C" void jpeg_diag_check_cinfo(struct jpeg_compress_struct *);
-
 RLBOX_DEFINE_BASE_TYPES_FOR(jpeg, process);
 
 int main(int argc, char const *argv[]) {
@@ -48,17 +45,11 @@ int main(int argc, char const *argv[]) {
     if(batch_size < 1) batch_size = 1;
   }
 
-  fprintf(stderr, "[progress] quality=%d batch_size=%d\n", quality, batch_size);
-
-  // Declare and create a new sandbox
-  fprintf(stderr, "[progress] creating sandbox...\n");
   double t_stage = monotonic_ms();
   rlbox_sandbox_jpeg sandbox;
   sandbox.create_sandbox(JPEG_PROCESS_WRAPPER_PATH);
-  fprintf(stderr, "[progress] sandbox created in %.1f ms\n", monotonic_ms() - t_stage);
 
   //put input stream inside sandbox
-  fprintf(stderr, "[progress] reading input file...\n");
   t_stage = monotonic_ms();
   FILE* source = fopen("test_data.txt", "r");
   int image_width, image_height, image_channels;
@@ -82,10 +73,8 @@ int main(int argc, char const *argv[]) {
 
     sandboxSource[i] = sandboxedRow;
   }
-  fprintf(stderr, "[progress] input loaded in %.1f ms\n", monotonic_ms() - t_stage);
 
   //allocate libjpeg objects in sandbox
-  fprintf(stderr, "[progress] setting up libjpeg objects in sandbox...\n");
   t_stage = monotonic_ms();
   auto cinfo = sandbox.malloc_in_sandbox<jpeg_compress_struct>();
   auto jerr = sandbox.malloc_in_sandbox<jpeg_error_mgr>();
@@ -93,61 +82,9 @@ int main(int argc, char const *argv[]) {
   auto returnedErr = sandbox.invoke_sandbox_function(jpeg_std_error, jerr);
   cinfo->err = returnedErr;
 
-  /*
-  // ---- Layout diagnostics (parent side) ----
-  fprintf(stderr, "[diag] JPEG_LIB_VERSION (parent header) = %d\n", JPEG_LIB_VERSION);
-  fprintf(stderr, "[diag] sizeof(jpeg_compress_struct) in parent = %zu\n",
-          sizeof(struct jpeg_compress_struct));
-  fprintf(stderr, "[diag] offsetof(jpeg_compress_struct, global_state) in parent = %zu\n",
-          offsetof(struct jpeg_compress_struct, global_state));
-  fprintf(stderr, "[diag] sizeof(jpeg_error_mgr) in parent = %zu\n",
-          sizeof(struct jpeg_error_mgr));
-
-  
-  // Check cinfo BEFORE jpeg_CreateCompress (should be uninitialized/garbage)
-  {
-    auto* raw = reinterpret_cast<struct jpeg_compress_struct*>(cinfo.UNSAFE_unverified());
-    fprintf(stderr, "[diag] cinfo raw ptr (UNSAFE_unverified) = %p\n", (void*)raw);
-    fprintf(stderr, "[diag] BEFORE CreateCompress: global_state=%d, err=%p\n",
-            raw->global_state, (void*)raw->err);
-    // Dump first 32 bytes of cinfo to catch offset surprises
-    unsigned char* bytes = reinterpret_cast<unsigned char*>(raw);
-    fprintf(stderr, "[diag] BEFORE CreateCompress raw bytes[0..31]:");
-    for (int i = 0; i < 32; i++) fprintf(stderr, " %02x", bytes[i]);
-    fprintf(stderr, "\n");
-  }
-    */
-
   // Pass the correct sizeof to CreateCompress; also log what we're passing
-  size_t parent_sizeof = sizeof(struct jpeg_compress_struct);
-  fprintf(stderr, "[diag] calling jpeg_CreateCompress(cinfo, version=%d, size=%zu)\n",
-          JPEG_LIB_VERSION, parent_sizeof);
-  sandbox.invoke_sandbox_function(jpeg_CreateCompress, cinfo, JPEG_LIB_VERSION, parent_sizeof);
-  fprintf(stderr, "[diag] jpeg_CreateCompress returned\n");
-
-  /*
-  // Check cinfo AFTER jpeg_CreateCompress (should have global_state=100=CSTATE_START)
-  {
-    auto* raw = reinterpret_cast<struct jpeg_compress_struct*>(cinfo.UNSAFE_unverified());
-    fprintf(stderr, "[diag] AFTER CreateCompress: global_state=%d (expect 100=CSTATE_START)\n",
-            raw->global_state);
-    fprintf(stderr, "[diag] AFTER CreateCompress: err=%p, image_width=%u\n",
-            (void*)raw->err, raw->image_width);
-    // Also read global_state via RLBox tainted accessor (not raw pointer)
-    int tainted_gs = cinfo->global_state.copy_and_verify([](int v){ return v; });
-    fprintf(stderr, "[diag] AFTER CreateCompress: global_state via RLBox tainted accessor = %d\n",
-            tainted_gs);
-    // Dump raw bytes again to see what actually changed at the pointer level
-    unsigned char* bytes = reinterpret_cast<unsigned char*>(raw);
-    fprintf(stderr, "[diag] AFTER CreateCompress raw bytes[0..31]:");
-    for (int i = 0; i < 32; i++) fprintf(stderr, " %02x", bytes[i]);
-    fprintf(stderr, "\n");
-    // Show the byte range covering global_state offset
-    size_t gs_off = offsetof(struct jpeg_compress_struct, global_state);
-    fprintf(stderr, "[diag] bytes at global_state offset %zu: %02x %02x %02x %02x\n",
-            gs_off, bytes[gs_off], bytes[gs_off+1], bytes[gs_off+2], bytes[gs_off+3]);
-  }
-            */
+  size_t struct_size = sizeof(struct jpeg_compress_struct);
+  sandbox.invoke_sandbox_function(jpeg_CreateCompress, cinfo, JPEG_LIB_VERSION, struct_size);
 
   //declare output file
   FILE* destinationFile;
@@ -171,16 +108,13 @@ int main(int argc, char const *argv[]) {
 
   sandbox.invoke_sandbox_function(jpeg_set_defaults, cinfo);
   sandbox.invoke_sandbox_function(jpeg_set_quality, cinfo, quality, true);
-  fprintf(stderr, "[progress] libjpeg setup done in %.1f ms\n", monotonic_ms() - t_stage);
 
   //begin compression cycle
   double t_sandbox_ms = 0.0, t0;
 
-  fprintf(stderr, "[progress] calling jpeg_start_compress...\n");
   t0 = monotonic_ms();
   sandbox.invoke_sandbox_function(jpeg_start_compress, cinfo, TRUE);
   t_sandbox_ms += monotonic_ms() - t0;
-  fprintf(stderr, "[progress] jpeg_start_compress done in %.1f ms\n", monotonic_ms() - t0);
 
   //write jpeg data to buffer in batches
   auto batchRows = sandbox.malloc_in_sandbox<JSAMPROW>(batch_size);
@@ -199,9 +133,7 @@ int main(int argc, char const *argv[]) {
 
     int remaining = verifiedImageHeight - verifiedNextScanline;
     int this_batch = (remaining < batch_size) ? remaining : batch_size;
-    fprintf(stderr, "[progress] jpeg_write_scanlines rows %d-%d / %d...\n",
-            verifiedNextScanline, verifiedNextScanline + this_batch - 1, verifiedImageHeight);
-
+    
     for (int b = 0; b < this_batch; b++) {
       batchRows[b] = sandboxSource[verifiedNextScanline + b];
     }
@@ -212,8 +144,6 @@ int main(int argc, char const *argv[]) {
     t_sandbox_ms += batch_ms;
 
     auto retval = write_ret.copy_and_verify([](unsigned int v) { return v; });
-    fprintf(stderr, "[diag] jpeg_write_scanlines returned %u (requested %d)\n",
-            retval, this_batch);
 
     verifiedNextScanline = cinfo->next_scanline.copy_and_verify([](int lines){
       release_assert(lines>=0, "Number of scanlines read so far must be non-negative");
@@ -228,11 +158,9 @@ int main(int argc, char const *argv[]) {
   }
 
   // complete compression cycle
-  fprintf(stderr, "[progress] calling jpeg_finish_compress...\n");
   t0 = monotonic_ms();
   sandbox.invoke_sandbox_function(jpeg_finish_compress, cinfo);
   t_sandbox_ms += monotonic_ms() - t0;
-  fprintf(stderr, "[progress] jpeg_finish_compress done in %.1f ms\n", monotonic_ms() - t0);
 
   printf("COMPRESSION_MS=%.3f\n", t_sandbox_ms);
 
