@@ -1,72 +1,56 @@
-# bench/ — zlib backend benchmark harness
+# bench/ — sandbox backend benchmark harness
 
-Compares the three zlib backends on the same workload:
+Drives every supported test library (currently zlib, libjpeg) across the
+three sandbox backends and emits CSVs under `bench/results/`.
 
-- **native** — stock libz, via `bench_native` (this directory).
-- **wasm2c** — RLBox wasm2c sandbox, via `test/zlib-testing/build/main`.
-- **process** — this repo's process sandbox, via `test/zlib-testing/build/main_process`.
+## Layout
 
-Each sandbox main emits a `SANDBOX_MS=… NATIVE_MS=…` line; `bench_native` emits `NATIVE_MS=…`. The driver parses those (plus its own wall-clock wrapper), writes a CSV, and the plot script produces graphs.
+- `run_benchmarks.py` — unified dispatcher (`zlib`, `jpeg`, or both)
+- `run_zlib_benchmarks.py` — zlib suite (sizes × levels × backends, incl. meta)
+- `run_jpeg_benchmarks.py` — libjpeg suite (qualities × backends)
+- `plot_results.py` — render plots from a CSV (auto-detects zlib vs jpeg)
+- `results/` — generated CSVs (auto-created)
+- `plots/` — generated PNGs (auto-created)
 
-## One-shot run
+## Quick start
 
 ```bash
-# 1. Build the wasm2c variant (default zlib-testing/build).
-cd test/zlib-testing
-cmake -DCMAKE_BUILD_TYPE=Release -S . -B build && cmake --build build --parallel
-
-# 2. Build a process variant per transport.  Each gets its own dir; the bench
-#    driver looks for build_rpclib/ and build_capnp/ by default.
-cmake -DCMAKE_BUILD_TYPE=Release -DRLBOX_TRANSPORT=rpclib -S . -B build_rpclib \
-  && cmake --build build_rpclib --parallel
-cmake -DCMAKE_BUILD_TYPE=Release -DRLBOX_TRANSPORT=capnp -S . -B build_capnp \
-  && cmake --build build_capnp --parallel
-# Seed pi.txt into each (the sandbox mains hard-code "pi.txt" in CWD).
-cp build/pi.txt build_rpclib/pi.txt
-cp build/pi.txt build_capnp/pi.txt
-
-# 3. Drive the benchmark. Defaults: sizes=256K,1M,4M,16M; levels=1,6,9; 3 iters.
-cd ../../bench
-python3 run_benchmarks.py
-
-# 4. Render plots.
-python3 plot_results.py
+# Build each test dir first; see test/<lib>-testing/ READMEs.
+cd bench
+python3 run_benchmarks.py                  # runs everything
+python3 run_benchmarks.py zlib             # just zlib
+python3 run_benchmarks.py --iters 5 jpeg   # just jpeg, 5 iters
 ```
 
-Output lands in `bench/results.csv` and `bench/plots/*.png`.
+Per-suite flags (sizes, levels, qualities, `--meta-policies`, etc.) live on
+the individual runners — invoke them directly:
 
-## Flags
-
-`run_benchmarks.py`:
-
-- `--wasm2c-build-dir PATH` — default `../test/zlib-testing/build`.
-- `--process-builds LIST` — comma-separated `label:path` or bare `subdir` (resolved under `test/zlib-testing/`). Default: `process_rpclib` + `process_capnp`.
-- `--sizes 256k,1m,4m,16m` — comma-separated; `k`/`m` suffixes ok.
-- `--levels 1,6,9` — comma-separated compression levels.
-- `--iters N` — iterations per (backend, size, level). Median is used for plotting.
-- `--no-wasm2c` / `--no-process` — skip a backend (e.g. if only one is built).
-
-`plot_results.py`:
-
-- `--csv PATH` — default `results.csv`.
-- `--out-dir PATH` — default `plots/`.
-
-## Inputs
-
-The sandbox mains hard-code `pi.txt` as their input and `./sandbox_shim.so` as the preloaded shim, so the driver runs each binary from the build directory. Before each size point, it overwrites `pi.txt` with the seed text repeated to the target size. The original `pi.txt` is backed up as `pi.txt.bench_backup` and restored when the run finishes (or crashes).
+```bash
+python3 run_zlib_benchmarks.py --sizes 1m,16m --levels 6 --meta-policies process,wasm,adaptive
+python3 run_jpeg_benchmarks.py --qualities 25,75
+```
 
 ## What the sandbox mains measure
 
-Both `main.cpp` and `main_process.cpp` now accumulate time separately for the sandboxed compression work and the in-process native baseline correctness check. `SANDBOX_MS` is the time spent inside the sandbox (including `rlbox::memcpy`, `malloc_in_sandbox`, `invoke_sandbox_function`, `copy_and_verify`, and `free_in_sandbox` — i.e. everything that actually crosses the boundary). `NATIVE_MS` is the time spent in the parallel stock-libz baseline inside the same process, for sanity against `bench_native`.
+`main.cpp` and `main_process.cpp` (both libs) emit `COMPRESSION_MS=…` for
+the sandboxed compression loop — everything that crosses the sandbox
+boundary, including `rlbox::memcpy`, `malloc_in_sandbox`, `invoke_sandbox_function`,
+`copy_and_verify`, and `free_in_sandbox`. `main_meta` emits `SANDBOX_MS=…`;
+the driver accepts both.
 
-## Plots
+For zlib, `bench_native` gives a stock-libz reference for the same input.
 
-- `plots/time_vs_size.png` — log-log median compression time vs input size, one line per backend, faceted by compression level.
-- `plots/overhead.png` — sandbox-to-native slowdown factor (bar chart), faceted by level.
-- `plots/throughput.png` — MB/s throughput, faceted by level.
+## Inputs
+
+The zlib sandbox mains hard-code `pi.txt` in CWD; the driver seeds it by
+repeating the original contents to the requested size and restores the
+original after the run (even on crash). The libjpeg mains read
+`rgb_grid.txt` (committed 1280×1014 RGB pixel grid — not varied).
 
 ## Caveats
 
-- The sandbox mains do a fair amount of correctness checking (copy-and-verify on every chunk). That work is *part of the sandboxing cost*, so it's included in `SANDBOX_MS` intentionally.
-- `bench_native` and the sandbox mains' internal native baseline both produce a side file (`compressed_native.bin`, `compressed.txt`, `compressed_baseline.txt`) — harmless; they get overwritten each run.
-- The process backend forks a child per `invoke_sandbox_function`. That cost is per-call; many small chunks amortize worse than a few large ones. The input-size sweep is what surfaces this effect.
+- The process backend forks a child per `invoke_sandbox_function`; many
+  small chunks amortize worse than a few large ones. Input-size /
+  compression-level sweeps surface this.
+- The mains do copy-and-verify on every chunk — that cost is part of
+  sandboxing and stays in `COMPRESSION_MS` intentionally.

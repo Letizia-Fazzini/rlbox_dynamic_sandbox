@@ -3,6 +3,14 @@
 #include <string.h>
 #include <stdint.h>
 #include <assert.h>
+#include <time.h>
+
+static double monotonic_ms()
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
+}
 
 #define release_assert(cond, msg) if (!(cond)) { fputs(msg "\n", stderr); abort(); }
 
@@ -96,6 +104,9 @@ int main(int argc, char const *argv[]) {
   sandbox.invoke_sandbox_function(jpeg_set_defaults, cinfo);
   sandbox.invoke_sandbox_function(jpeg_set_quality, cinfo, quality, true);
 
+  double t_sandbox_ms = 0.0, t0;
+  t0 = monotonic_ms();
+
   //begin compression cycle
   sandbox.invoke_sandbox_function(jpeg_start_compress, cinfo, TRUE);
 
@@ -131,6 +142,8 @@ int main(int argc, char const *argv[]) {
   // complete compression cycle
   sandbox.invoke_sandbox_function(jpeg_finish_compress, cinfo);
 
+  t_sandbox_ms += monotonic_ms() - t0;
+
   //destroy jpeg object
   sandbox.invoke_sandbox_function(jpeg_destroy_compress, cinfo);
 
@@ -156,6 +169,8 @@ int main(int argc, char const *argv[]) {
 
   // destroy sandbox
   sandbox.destroy_sandbox();
+
+  printf("COMPRESSION_MS=%.3f\n", t_sandbox_ms);
 
   return 0;
 }

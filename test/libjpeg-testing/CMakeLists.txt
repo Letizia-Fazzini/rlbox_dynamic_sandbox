@@ -1,7 +1,9 @@
-cmake_minimum_required(VERSION 3.30)
+cmake_minimum_required(VERSION 3.14)
 
 # TODO: Migrate from FetchContent_Populate
-cmake_policy(SET CMP0169 OLD)
+if(POLICY CMP0169)
+  cmake_policy(SET CMP0169 OLD)
+endif()
 
 project(rlbox_wasm_example
 	VERSION 0.1
@@ -304,6 +306,179 @@ target_include_directories(main PUBLIC ${rlbox_SOURCE_DIR}/code/include
                                 PUBLIC ${CMAKE_BINARY_DIR})
 target_link_libraries(main jpeg_sandboxed pthread JPEG::JPEG)
 
+# Bulk-scanlines "stress" variant: one jpeg_write_scanlines invoke covering
+# every row, vs ~1014 per-row invokes in main.cpp. Companion to
+# main_process_stress — together they surface the regime where the per-
+# invoke fork() cost amortizes across an entire frame.
+add_executable(main_stress main_stress.cpp)
+target_include_directories(main_stress PUBLIC ${rlbox_SOURCE_DIR}/code/include
+                                       PUBLIC ${rlbox_wasm2c_sandbox_SOURCE_DIR}/include
+                                       PUBLIC ${jpeg_wasm_SOURCE_DIR}
+                                       PUBLIC ${JPEG_WASM_CONFIG_DIR}
+                                       PUBLIC ${CMAKE_BINARY_DIR})
+target_link_libraries(main_stress jpeg_sandboxed pthread JPEG::JPEG)
+
+################### Build libjpeg-turbo natively (v62 ABI) ###################
+#
+# The host distro ships libjpeg-turbo at JPEG_LIB_VERSION 80, which adds
+# fields to jpeg_compress_struct that shift all subsequent field offsets.
+# jpeg_structs.h reflects the v62 layout (matching the wasm build above),
+# so the process backend must link a native libjpeg-turbo also built at
+# v62 or the sandboxed struct accesses land at the wrong offsets.
+#
+# We reuse the fetched libjpeg-turbo 3.0.1 source and build only the
+# 8-bit core (no 12/16-bit recompiles and no lossless support, which
+# together are what require the repeat-compile dance in the wasm build).
+
+set(JPEG_NATIVE_CONFIG_DIR "${CMAKE_BINARY_DIR}/jpeg_native_config")
+file(MAKE_DIRECTORY ${JPEG_NATIVE_CONFIG_DIR})
+
+file(WRITE ${JPEG_NATIVE_CONFIG_DIR}/jconfig.h
+"/* jconfig.h - generated for native host build (v62 ABI) */\n\
+#define JPEG_LIB_VERSION 62\n\
+#define LIBJPEG_TURBO_VERSION 3.0.1\n\
+#define LIBJPEG_TURBO_VERSION_NUMBER 3000001\n\
+#define HAVE_PROTOTYPES 1\n\
+#define HAVE_UNSIGNED_CHAR 1\n\
+#define HAVE_UNSIGNED_SHORT 1\n\
+#define HAVE_STDDEF_H 1\n\
+#define HAVE_STDLIB_H 1\n\
+#define HAVE_LOCALE_H 1\n\
+#define C_ARITH_CODING_SUPPORTED 1\n\
+#define D_ARITH_CODING_SUPPORTED 1\n\
+#define MEM_SRCDST_SUPPORTED 1\n\
+#ifndef BITS_IN_JSAMPLE\n\
+#define BITS_IN_JSAMPLE 8\n\
+#endif\n\
+#define NEED_SYS_TYPES_H 1\n\
+#ifdef JPEG_INTERNALS\n\
+#define INLINE inline\n\
+#endif\n"
+)
+
+file(WRITE ${JPEG_NATIVE_CONFIG_DIR}/jconfigint.h
+"/* jconfigint.h - generated for native host build */\n\
+#define BUILD \"\"\n\
+#define INLINE inline\n\
+#define THREAD_LOCAL __thread\n\
+#define PACKAGE_NAME \"libjpeg-turbo\"\n\
+#define VERSION \"3.0.1\"\n\
+#define SIZEOF_SIZE_T 8\n\
+#define FALLTHROUGH\n\
+#undef HAVE_BUILTIN_CTZL\n\
+#undef HAVE_INTRIN_H\n"
+)
+
+file(WRITE ${JPEG_NATIVE_CONFIG_DIR}/jversion.h
+"/* jversion.h - generated for native host build */\n\
+#define JVERSION \"3.0.1\"\n\
+#define JCOPYRIGHT \"Copyright (C) the libjpeg-turbo Project\"\n\
+#define JCOPYRIGHT_SHORT JCOPYRIGHT\n"
+)
+
+# jmorecfg.h unconditionally defines C_LOSSLESS_SUPPORTED /
+# D_LOSSLESS_SUPPORTED, and jdmaster.c / jcmaster.c unconditionally
+# reference the j12init_* / j16init_* entry points via switch-on-
+# data_precision (lines 576..719 of jdmaster.c). So we need the 12-bit
+# and 16-bit recompiles to provide those symbols even though our own
+# code path never trips them.
+#
+# The per-precision compiles are the same source set scoped down from
+# JPEG16_SOURCES / JPEG12_SOURCES (mirroring the wasm build). Name
+# mangling comes from jmorecfg.h: BITS_IN_JSAMPLE != 8 triggers
+# jsamplecomp.h which #defines the function identifiers to their
+# j12<name> / j16<name> variants at preprocess time.
+set(JPEG_NATIVE_16_SOURCES
+  ${jpeg_wasm_SOURCE_DIR}/jcapistd.c
+  ${jpeg_wasm_SOURCE_DIR}/jccolor.c
+  ${jpeg_wasm_SOURCE_DIR}/jcdiffct.c
+  ${jpeg_wasm_SOURCE_DIR}/jclossls.c
+  ${jpeg_wasm_SOURCE_DIR}/jcmainct.c
+  ${jpeg_wasm_SOURCE_DIR}/jcprepct.c
+  ${jpeg_wasm_SOURCE_DIR}/jcsample.c
+  ${jpeg_wasm_SOURCE_DIR}/jdapistd.c
+  ${jpeg_wasm_SOURCE_DIR}/jdcolor.c
+  ${jpeg_wasm_SOURCE_DIR}/jddiffct.c
+  ${jpeg_wasm_SOURCE_DIR}/jdlossls.c
+  ${jpeg_wasm_SOURCE_DIR}/jdmainct.c
+  ${jpeg_wasm_SOURCE_DIR}/jdpostct.c
+  ${jpeg_wasm_SOURCE_DIR}/jdsample.c
+  ${jpeg_wasm_SOURCE_DIR}/jutils.c
+)
+set(JPEG_NATIVE_12_SOURCES ${JPEG_NATIVE_16_SOURCES}
+  ${jpeg_wasm_SOURCE_DIR}/jccoefct.c
+  ${jpeg_wasm_SOURCE_DIR}/jcdctmgr.c
+  ${jpeg_wasm_SOURCE_DIR}/jdcoefct.c
+  ${jpeg_wasm_SOURCE_DIR}/jddctmgr.c
+  ${jpeg_wasm_SOURCE_DIR}/jdmerge.c
+  ${jpeg_wasm_SOURCE_DIR}/jfdctfst.c
+  ${jpeg_wasm_SOURCE_DIR}/jfdctint.c
+  ${jpeg_wasm_SOURCE_DIR}/jidctflt.c
+  ${jpeg_wasm_SOURCE_DIR}/jidctfst.c
+  ${jpeg_wasm_SOURCE_DIR}/jidctint.c
+  ${jpeg_wasm_SOURCE_DIR}/jidctred.c
+  ${jpeg_wasm_SOURCE_DIR}/jquant1.c
+  ${jpeg_wasm_SOURCE_DIR}/jquant2.c
+)
+# 8-bit core — superset compiled at default BITS_IN_JSAMPLE=8.
+set(JPEG_NATIVE_8_SOURCES ${JPEG_NATIVE_12_SOURCES}
+  ${jpeg_wasm_SOURCE_DIR}/jcapimin.c
+  ${jpeg_wasm_SOURCE_DIR}/jchuff.c
+  ${jpeg_wasm_SOURCE_DIR}/jcicc.c
+  ${jpeg_wasm_SOURCE_DIR}/jcinit.c
+  ${jpeg_wasm_SOURCE_DIR}/jclhuff.c
+  ${jpeg_wasm_SOURCE_DIR}/jcmarker.c
+  ${jpeg_wasm_SOURCE_DIR}/jcmaster.c
+  ${jpeg_wasm_SOURCE_DIR}/jcomapi.c
+  ${jpeg_wasm_SOURCE_DIR}/jcparam.c
+  ${jpeg_wasm_SOURCE_DIR}/jcphuff.c
+  ${jpeg_wasm_SOURCE_DIR}/jctrans.c
+  ${jpeg_wasm_SOURCE_DIR}/jdapimin.c
+  ${jpeg_wasm_SOURCE_DIR}/jdatadst.c
+  ${jpeg_wasm_SOURCE_DIR}/jdatasrc.c
+  ${jpeg_wasm_SOURCE_DIR}/jdhuff.c
+  ${jpeg_wasm_SOURCE_DIR}/jdicc.c
+  ${jpeg_wasm_SOURCE_DIR}/jdinput.c
+  ${jpeg_wasm_SOURCE_DIR}/jdlhuff.c
+  ${jpeg_wasm_SOURCE_DIR}/jdmarker.c
+  ${jpeg_wasm_SOURCE_DIR}/jdmaster.c
+  ${jpeg_wasm_SOURCE_DIR}/jdphuff.c
+  ${jpeg_wasm_SOURCE_DIR}/jdtrans.c
+  ${jpeg_wasm_SOURCE_DIR}/jerror.c
+  ${jpeg_wasm_SOURCE_DIR}/jfdctflt.c
+  ${jpeg_wasm_SOURCE_DIR}/jmemmgr.c
+  ${jpeg_wasm_SOURCE_DIR}/jmemnobs.c
+  ${jpeg_wasm_SOURCE_DIR}/jaricom.c
+  ${jpeg_wasm_SOURCE_DIR}/jcarith.c
+  ${jpeg_wasm_SOURCE_DIR}/jdarith.c
+)
+
+add_library(jpeg_native_12 OBJECT ${JPEG_NATIVE_12_SOURCES})
+target_include_directories(jpeg_native_12 PRIVATE
+                           ${jpeg_wasm_SOURCE_DIR}
+                           ${JPEG_NATIVE_CONFIG_DIR})
+target_compile_definitions(jpeg_native_12 PRIVATE BITS_IN_JSAMPLE=12)
+target_compile_options(jpeg_native_12 PRIVATE -O3)
+set_property(TARGET jpeg_native_12 PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+add_library(jpeg_native_16 OBJECT ${JPEG_NATIVE_16_SOURCES})
+target_include_directories(jpeg_native_16 PRIVATE
+                           ${jpeg_wasm_SOURCE_DIR}
+                           ${JPEG_NATIVE_CONFIG_DIR})
+target_compile_definitions(jpeg_native_16 PRIVATE BITS_IN_JSAMPLE=16)
+target_compile_options(jpeg_native_16 PRIVATE -O3)
+set_property(TARGET jpeg_native_16 PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+add_library(jpeg_native STATIC
+            ${JPEG_NATIVE_8_SOURCES}
+            $<TARGET_OBJECTS:jpeg_native_12>
+            $<TARGET_OBJECTS:jpeg_native_16>)
+target_include_directories(jpeg_native PUBLIC
+                           ${jpeg_wasm_SOURCE_DIR}
+                           ${JPEG_NATIVE_CONFIG_DIR})
+target_compile_options(jpeg_native PRIVATE -O3)
+set_property(TARGET jpeg_native PROPERTY POSITION_INDEPENDENT_CODE ON)
+
 ################### Process-sandbox variant ###################
 #
 # Builds a second binary that runs libjpeg-turbo via rlbox_process_sandbox
@@ -316,15 +491,18 @@ set(RLBOX_DYNAMIC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${RLBOX_DYNAMIC_ROOT} rlbox_dynamic_parent EXCLUDE_FROM_ALL)
 
 # Child-side wrapper: a long-running process whose dynamic symbol table
-# exposes libjpeg-turbo to the shim's dlsym(RTLD_DEFAULT, ...).
-# -rdynamic keeps the linker from pruning libjpeg's externally-referenced
-# symbols.
+# exposes libjpeg-turbo to the shim's dlsym(RTLD_DEFAULT, ...). Links
+# against our native v62-ABI libjpeg-turbo so its struct layout matches
+# the wasm side and jpeg_structs.h.
 add_executable(jpeg_process_wrapper
                ${RLBOX_DYNAMIC_ROOT}/c_src/process_sandbox_wrapper.c)
-target_link_libraries(jpeg_process_wrapper PRIVATE JPEG::JPEG)
+target_link_libraries(jpeg_process_wrapper PRIVATE
+                      "-Wl,--whole-archive" jpeg_native "-Wl,--no-whole-archive")
 target_link_options(jpeg_process_wrapper PRIVATE "-rdynamic")
 
-# Host-side main that uses the process sandbox.
+# Host-side main that uses the process sandbox. Includes the fetched
+# libjpeg-turbo headers (via jpeg_native's PUBLIC include dirs) so
+# sizeof(jpeg_compress_struct) matches the child's view.
 add_executable(main_process
                main_process.cpp
                ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp)
@@ -334,7 +512,7 @@ target_include_directories(main_process PRIVATE
 target_link_libraries(main_process PRIVATE
                       rlbox_dynamic
                       pthread
-                      JPEG::JPEG)
+                      jpeg_native)
 target_compile_definitions(main_process PRIVATE
   JPEG_PROCESS_WRAPPER_PATH="$<TARGET_FILE:jpeg_process_wrapper>")
 
@@ -344,3 +522,24 @@ add_custom_command(TARGET main_process POST_BUILD
                            $<TARGET_FILE_DIR:main_process>/sandbox_shim.so
                    DEPENDS sandbox_shim)
 add_dependencies(main_process sandbox_shim jpeg_process_wrapper)
+
+# Process-backed "stress" variant — one jpeg_write_scanlines invoke per frame.
+add_executable(main_process_stress
+               main_process_stress.cpp
+               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp)
+target_include_directories(main_process_stress PRIVATE
+                           ${rlbox_SOURCE_DIR}/code/include
+                           ${RLBOX_DYNAMIC_ROOT}/include)
+target_link_libraries(main_process_stress PRIVATE
+                      rlbox_dynamic
+                      pthread
+                      jpeg_native)
+target_compile_definitions(main_process_stress PRIVATE
+  JPEG_PROCESS_WRAPPER_PATH="$<TARGET_FILE:jpeg_process_wrapper>")
+
+add_custom_command(TARGET main_process_stress POST_BUILD
+                   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                           $<TARGET_FILE:sandbox_shim>
+                           $<TARGET_FILE_DIR:main_process_stress>/sandbox_shim.so
+                   DEPENDS sandbox_shim)
+add_dependencies(main_process_stress sandbox_shim jpeg_process_wrapper)

@@ -169,6 +169,15 @@ target_include_directories(main PUBLIC ${rlbox_SOURCE_DIR}/code/include
                                 PUBLIC ${zlib_wasm_SOURCE_DIR})
 target_link_libraries(main zlib_sandboxed pthread ZLIB::ZLIB)
 
+# One-shot "stress" variant: one deflate(Z_FINISH) invoke over the whole
+# stream. Amortizes per-call overhead — the companion to main_process_stress
+# so process fork() cost is paid once per compression.
+add_executable(main_stress main_stress.cpp)
+target_include_directories(main_stress PUBLIC ${rlbox_SOURCE_DIR}/code/include
+                                       PUBLIC ${rlbox_wasm2c_sandbox_SOURCE_DIR}/include
+                                       PUBLIC ${zlib_wasm_SOURCE_DIR})
+target_link_libraries(main_stress zlib_sandboxed pthread ZLIB::ZLIB)
+
 ################### Process-sandbox variant ###################
 #
 # Builds a second binary that runs zlib via rlbox_process_sandbox (fork +
@@ -213,5 +222,60 @@ add_custom_command(TARGET main_process POST_BUILD
                    DEPENDS sandbox_shim)
 add_dependencies(main_process sandbox_shim zlib_process_wrapper)
 
+# Process-backed "stress" variant — one deflate invoke per stream.
+add_executable(main_process_stress
+               main_process_stress.cpp
+               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp)
+target_include_directories(main_process_stress PRIVATE
+                           ${rlbox_SOURCE_DIR}/code/include
+                           ${RLBOX_DYNAMIC_ROOT}/include)
+target_link_libraries(main_process_stress PRIVATE
+                      rlbox_dynamic
+                      pthread
+                      ZLIB::ZLIB)
+target_compile_definitions(main_process_stress PRIVATE
+  ZLIB_PROCESS_WRAPPER_PATH="$<TARGET_FILE:zlib_process_wrapper>")
+
+add_custom_command(TARGET main_process_stress POST_BUILD
+                   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                           $<TARGET_FILE:sandbox_shim>
+                           $<TARGET_FILE_DIR:main_process_stress>/sandbox_shim.so
+                   DEPENDS sandbox_shim)
+add_dependencies(main_process_stress sandbox_shim zlib_process_wrapper)
+
 add_executable(bench_native ${CMAKE_CURRENT_SOURCE_DIR}/bench_native.c)
 target_link_libraries(bench_native pthread ZLIB::ZLIB)
+
+################### Meta-sandbox variant ###################
+#
+# Builds main_meta, which composes rlbox_process_sandbox + rlbox_wasm2c_sandbox
+# via include/rlbox_meta_sandbox.hpp.  Runs under a user-selected
+# policy: process, wasm, or adaptive.
+
+add_executable(main_meta
+               main_meta.cpp
+               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp)
+target_include_directories(main_meta PRIVATE
+                           ${rlbox_SOURCE_DIR}/code/include
+                           ${rlbox_wasm2c_sandbox_SOURCE_DIR}/include
+                           ${RLBOX_DYNAMIC_ROOT}/include
+                           ${zlib_wasm_SOURCE_DIR}
+                           ${CMAKE_BINARY_DIR})
+# -rdynamic is required so the wasm2c-generated `w2c_<module>_<fn>` thunks
+# are exported in the dynamic symbol table for the meta's runtime
+# dlsym(RTLD_DEFAULT, ...) resolution.  See the M3 design note.
+target_link_options(main_meta PRIVATE "-rdynamic")
+target_link_libraries(main_meta PRIVATE
+                      rlbox_dynamic
+                      zlib_sandboxed
+                      pthread
+                      ZLIB::ZLIB)
+target_compile_definitions(main_meta PRIVATE
+  ZLIB_PROCESS_WRAPPER_PATH="$<TARGET_FILE:zlib_process_wrapper>")
+
+add_custom_command(TARGET main_meta POST_BUILD
+                   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                           $<TARGET_FILE:sandbox_shim>
+                           $<TARGET_FILE_DIR:main_meta>/sandbox_shim.so
+                   DEPENDS sandbox_shim)
+add_dependencies(main_meta sandbox_shim zlib_process_wrapper)
