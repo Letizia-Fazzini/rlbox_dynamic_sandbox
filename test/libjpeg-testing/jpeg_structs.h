@@ -5,7 +5,7 @@
 // Add rlbox_load_structs_from_library-compatible struct definitions here
 // as needed when calling libjpeg-turbo functions across the sandbox boundary.
 //
-// Matches libjpeg-turbo with JPEG_LIB_VERSION=62 (< 70, < 80).
+// Matches libjpeg-turbo with JPEG_LIB_VERSION=80 (libjpeg-turbo 3.0.1).
 // Types are lowered to their underlying primitives:
 //   boolean  -> int,  JDIMENSION -> unsigned int
 //   UINT8    -> unsigned char,  UINT16 -> unsigned short
@@ -31,8 +31,7 @@
   f(int, last_addon_message, FIELD_NORMAL, ##__VA_ARGS__) g()
 
 // jpeg_compress_struct: jpeg_common_fields expanded inline, then
-// compression-specific fields.  Version-gated blocks (#if JPEG_LIB_VERSION
-// >= 70/80) are omitted because JPEG_LIB_VERSION is 62 for this build.
+// compression-specific fields.
 #define sandbox_fields_reflection_jpeg_class_jpeg_compress_struct(f, g, ...)   \
   /* jpeg_common_fields */                                                       \
   f(struct jpeg_error_mgr *, err, FIELD_NORMAL, ##__VA_ARGS__) g()              \
@@ -48,12 +47,18 @@
   f(int, input_components, FIELD_NORMAL, ##__VA_ARGS__) g()                     \
   f(int, in_color_space, FIELD_NORMAL, ##__VA_ARGS__) g()                       \
   f(double, input_gamma, FIELD_NORMAL, ##__VA_ARGS__) g()                       \
+  /* JPEG_LIB_VERSION >= 70 additions */                                        \
+  f(unsigned int, scale_num, FIELD_NORMAL, ##__VA_ARGS__) g()                   \
+  f(unsigned int, scale_denom, FIELD_NORMAL, ##__VA_ARGS__) g()                 \
+  f(unsigned int, jpeg_width, FIELD_NORMAL, ##__VA_ARGS__) g()                  \
+  f(unsigned int, jpeg_height, FIELD_NORMAL, ##__VA_ARGS__) g()                 \
   /* compression parameters */                                                   \
   f(int, data_precision, FIELD_NORMAL, ##__VA_ARGS__) g()                       \
   f(int, num_components, FIELD_NORMAL, ##__VA_ARGS__) g()                       \
   f(int, jpeg_color_space, FIELD_NORMAL, ##__VA_ARGS__) g()                     \
   f(jpeg_component_info *, comp_info, FIELD_NORMAL, ##__VA_ARGS__) g()          \
   f(JQUANT_TBL *[4], quant_tbl_ptrs, FIELD_NORMAL, ##__VA_ARGS__) g()          \
+  f(int[4], q_scale_factor, FIELD_NORMAL, ##__VA_ARGS__) g()                    \
   f(JHUFF_TBL *[4], dc_huff_tbl_ptrs, FIELD_NORMAL, ##__VA_ARGS__) g()         \
   f(JHUFF_TBL *[4], ac_huff_tbl_ptrs, FIELD_NORMAL, ##__VA_ARGS__) g()         \
   f(unsigned char[16], arith_dc_L, FIELD_NORMAL, ##__VA_ARGS__) g()            \
@@ -65,6 +70,7 @@
   f(int, arith_code, FIELD_NORMAL, ##__VA_ARGS__) g()                           \
   f(int, optimize_coding, FIELD_NORMAL, ##__VA_ARGS__) g()                      \
   f(int, CCIR601_sampling, FIELD_NORMAL, ##__VA_ARGS__) g()                     \
+  f(int, do_fancy_downsampling, FIELD_NORMAL, ##__VA_ARGS__) g()                \
   f(int, smoothing_factor, FIELD_NORMAL, ##__VA_ARGS__) g()                     \
   f(int, dct_method, FIELD_NORMAL, ##__VA_ARGS__) g()                           \
   f(unsigned int, restart_interval, FIELD_NORMAL, ##__VA_ARGS__) g()            \

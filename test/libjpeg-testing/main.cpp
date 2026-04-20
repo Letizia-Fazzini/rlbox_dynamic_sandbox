@@ -3,6 +3,14 @@
 #include <string.h>
 #include <stdint.h>
 #include <assert.h>
+#include <time.h>
+
+static double monotonic_ms()
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
+}
 
 #define release_assert(cond, msg) if (!(cond)) { fputs(msg "\n", stderr); abort(); }
 
@@ -34,14 +42,20 @@ int main(int argc, char const *argv[]) {
   int quality = 50;
   if(argc>1) {
     quality = std::stoi(argv[1]);
-  }  
+  }
+
+  int batch_size = 1;
+  if(argc>2) {
+    batch_size = std::stoi(argv[2]);
+    if(batch_size < 1) batch_size = 1;
+  }
 
   // Declare and create a new sandbox
   rlbox_sandbox_jpeg sandbox;
   sandbox.create_sandbox();
 
   //put input stream inside sandbox
-  FILE* source = fopen("rgb_grid.txt", "r");
+  FILE* source = fopen("test_data.txt", "r");
   int image_width, image_height, image_channels;
   fscanf(source, "%d %d %d", &image_width, &image_height, &image_channels);
   int row_stride = image_width * image_channels * sizeof(JSAMPLE);
@@ -97,10 +111,14 @@ int main(int argc, char const *argv[]) {
   sandbox.invoke_sandbox_function(jpeg_set_quality, cinfo, quality, true);
 
   //begin compression cycle
-  sandbox.invoke_sandbox_function(jpeg_start_compress, cinfo, TRUE);
+  double t_sandbox_ms = 0.0, t0;
 
-  //JSAMPROW row_pointer[1];
-  auto currentSandboxRow = sandbox.malloc_in_sandbox<JSAMPROW>();
+  t0 = monotonic_ms();
+  sandbox.invoke_sandbox_function(jpeg_start_compress, cinfo, TRUE);
+  t_sandbox_ms += monotonic_ms() - t0;
+
+  //write jpeg data to buffer in batches
+  auto batchRows = sandbox.malloc_in_sandbox<JSAMPROW>(batch_size);
   auto verifiedNextScanline = cinfo->next_scanline.copy_and_verify([](int lines){
     release_assert(lines>=0, "Number of scanlines read so far must be non-negative");
     return lines;
@@ -111,11 +129,18 @@ int main(int argc, char const *argv[]) {
     return height;
   });
 
-  //write jpeg data to buffer
   while (verifiedNextScanline < verifiedImageHeight) {
 
-    currentSandboxRow[0] = sandboxSource[verifiedNextScanline];
-    (void) sandbox.invoke_sandbox_function(jpeg_write_scanlines, cinfo, currentSandboxRow, 1);
+    int remaining = verifiedImageHeight - verifiedNextScanline;
+    int this_batch = (remaining < batch_size) ? remaining : batch_size;
+
+    for (int b = 0; b < this_batch; b++) {
+      batchRows[b] = sandboxSource[verifiedNextScanline + b];
+    }
+
+    t0 = monotonic_ms();
+    (void) sandbox.invoke_sandbox_function(jpeg_write_scanlines, cinfo, batchRows, this_batch);
+    t_sandbox_ms += monotonic_ms() - t0;
 
     verifiedNextScanline = cinfo->next_scanline.copy_and_verify([](int lines){
       release_assert(lines>=0, "Number of scanlines read so far must be non-negative");
@@ -129,14 +154,18 @@ int main(int argc, char const *argv[]) {
   }
 
   // complete compression cycle
+  t0 = monotonic_ms();
   sandbox.invoke_sandbox_function(jpeg_finish_compress, cinfo);
+  t_sandbox_ms += monotonic_ms() - t0;
+
+  printf("COMPRESSION_MS=%.3f\n", t_sandbox_ms);
 
   //destroy jpeg object
   sandbox.invoke_sandbox_function(jpeg_destroy_compress, cinfo);
 
   //free sandbox resources
   sandbox.free_in_sandbox(sandboxSource);
-  sandbox.free_in_sandbox(currentSandboxRow);
+  sandbox.free_in_sandbox(batchRows);
 
   //copy data from sandbox buffer "outBuffer" to "compressed.jpeg"
   auto verifiedSizePtr = outSize.copy_and_verify([](std::unique_ptr<unsigned long> size) {

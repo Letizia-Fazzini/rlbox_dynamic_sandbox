@@ -213,5 +213,5 @@ add_custom_command(TARGET main_process POST_BUILD
                    DEPENDS sandbox_shim)
 add_dependencies(main_process sandbox_shim zlib_process_wrapper)
 
-add_executable(bench_native ${CMAKE_CURRENT_SOURCE_DIR}/bench_native.c)
+add_executable(bench_native ${CMAKE_CURRENT_SOURCE_DIR}/bench_native.cpp)
 target_link_libraries(bench_native pthread ZLIB::ZLIB)

@@ -44,8 +44,9 @@ int main(int argc, char const *argv[]) {
   rlbox_sandbox_zlib sandbox;
   sandbox.create_sandbox(ZLIB_PROCESS_WRAPPER_PATH);
 
-  FILE* source = fopen("pi.txt","r");
-  FILE* dest = fopen("compressed.txt", "w");
+  FILE* source = fopen("test_data.txt","r");
+  FILE* dest = fopen("compressed.bin", "w");
+  
   int  flush;
   unsigned have;
   z_stream initStream;

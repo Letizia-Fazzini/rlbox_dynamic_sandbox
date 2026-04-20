@@ -15,6 +15,7 @@
 #include <string.h>
 #include <time.h>
 #include <zlib.h>
+#include <string>
 
 #define CHUNK 16384
 
@@ -27,15 +28,13 @@ static double monotonic_ms(void)
 
 int main(int argc, char const* argv[])
 {
-  if (argc < 3) {
-    fprintf(stderr, "usage: %s <input_path> <level>\n", argv[0]);
-    return 2;
+  int level = 2;
+  if(argc>1) {
+    level = std::stoi(argv[1]);
   }
-  const char* input_path = argv[1];
-  int level = atoi(argv[2]);
 
-  FILE* source = fopen(input_path, "rb");
-  FILE* dest = fopen("compressed_native.bin", "wb");
+  FILE* source = fopen("test_data.txt", "rb");
+  FILE* dest = fopen("compressed.bin", "wb");
   if (!source || !dest) {
     perror("fopen");
     return 1;

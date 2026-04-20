@@ -50,8 +50,9 @@ int main(int argc, char const *argv[]) {
   sandbox.create_sandbox();
 
   //sandbox variables
-  FILE* source = fopen("pi.txt","r");
-  FILE* dest = fopen("compressed.txt", "w");
+  FILE* source = fopen("test_data.txt","r");
+  FILE* dest = fopen("compressed.bin", "w");
+
   int  flush;
   unsigned have;
   z_stream initStream;

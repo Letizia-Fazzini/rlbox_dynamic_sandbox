@@ -112,7 +112,7 @@ file(MAKE_DIRECTORY ${JPEG_WASM_CONFIG_DIR})
 
 file(WRITE ${JPEG_WASM_CONFIG_DIR}/jconfig.h
 "/* jconfig.h - generated for WASM build */\n\
-#define JPEG_LIB_VERSION 62\n\
+#define JPEG_LIB_VERSION 80\n\
 #define LIBJPEG_TURBO_VERSION 3.0.1\n\
 #define LIBJPEG_TURBO_VERSION_NUMBER 3000001\n\
 #define HAVE_PROTOTYPES 1\n\
@@ -322,8 +322,7 @@ add_subdirectory(${RLBOX_DYNAMIC_ROOT} rlbox_dynamic_parent EXCLUDE_FROM_ALL)
 add_executable(jpeg_process_wrapper
                ${RLBOX_DYNAMIC_ROOT}/c_src/process_sandbox_wrapper.c)
 target_link_libraries(jpeg_process_wrapper PRIVATE JPEG::JPEG)
-target_link_options(jpeg_process_wrapper PRIVATE "-rdynamic")
-
+target_link_options(jpeg_process_wrapper PRIVATE "-rdynamic" "-Wl,--no-as-needed")
 # Host-side main that uses the process sandbox.
 add_executable(main_process
                main_process.cpp
@@ -344,3 +343,6 @@ add_custom_command(TARGET main_process POST_BUILD
                            $<TARGET_FILE_DIR:main_process>/sandbox_shim.so
                    DEPENDS sandbox_shim)
 add_dependencies(main_process sandbox_shim jpeg_process_wrapper)
+
+add_executable(bench_native ${CMAKE_CURRENT_SOURCE_DIR}/bench_native.cpp)
+target_link_libraries(bench_native pthread JPEG::JPEG)
