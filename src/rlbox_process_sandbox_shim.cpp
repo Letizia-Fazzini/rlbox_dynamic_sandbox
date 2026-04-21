@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -16,6 +17,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 #include "rlbox_process_abi.hpp"
 
@@ -108,7 +110,13 @@ static int g_callback_fd = -1;
 // multi-threaded in the future.
 static std::mutex g_callback_fd_mutex;
 #endif
-static constexpr size_t k_callback_slots = 16;
+// Compile-time-fixed because each slot needs a distinct trampoline function
+// with a unique address.  Overridable via -DRLBOX_CALLBACK_SLOTS=N at build
+// time; bump if a library registers more callbacks than fit.
+#ifndef RLBOX_CALLBACK_SLOTS
+#  define RLBOX_CALLBACK_SLOTS 64
+#endif
+static constexpr size_t k_callback_slots = RLBOX_CALLBACK_SLOTS;
 // The slot array lives in the shared mspace so that pre-forked workers
 // (which inherit the *pointer* at fork time) read up-to-date keys via
 // shared memory, not their own private snapshot. atomic<uintptr_t> is
@@ -133,28 +141,7 @@ static void init_shared_callback_keys()
   g_callback_keys = slots;
 }
 
-#define TRAMPOLINE_LIST(V)                                                     \
-  V(0)                                                                         \
-  V(1) V(2) V(3) V(4) V(5) V(6) V(7) V(8) V(9) V(10) V(11) V(12) V(13) V(14)   \
-    V(15)
-
-#if defined(RLBOX_TRANSPORT_RPCLIB)
-#  define DEFINE_TRAMPOLINE(i)                                                 \
-    extern "C" int64_t trampoline_##i(                                         \
-      int64_t a, int64_t b, int64_t c, int64_t d)                              \
-    {                                                                          \
-      if (!g_callback_client || !g_callback_keys) {                            \
-        return 0;                                                              \
-      }                                                                        \
-      uintptr_t key = g_callback_keys[i].load(std::memory_order_acquire);      \
-      if (key == 0) {                                                          \
-        return 0;                                                              \
-      }                                                                        \
-      std::vector<int64_t> args = { a, b, c, d };                              \
-      auto res = g_callback_client->call("trigger_callback", key, args);       \
-      return res.as<int64_t>();                                                \
-    }
-#elif defined(RLBOX_TRANSPORT_CAPNP)
+#if defined(RLBOX_TRANSPORT_CAPNP)
 // Helper: send a CallbackRequest, await CallbackResponse.  Mutex-serialized
 // for the same reason capnp_call is on the host side.
 static int64_t fire_callback(uintptr_t key,
@@ -183,26 +170,53 @@ static int64_t fire_callback(uintptr_t key,
     return 0;
   }
 }
-
-#  define DEFINE_TRAMPOLINE(i)                                                 \
-    extern "C" int64_t trampoline_##i(                                         \
-      int64_t a, int64_t b, int64_t c, int64_t d)                              \
-    {                                                                          \
-      if (g_callback_fd < 0 || !g_callback_keys) {                             \
-        return 0;                                                              \
-      }                                                                        \
-      uintptr_t key = g_callback_keys[i].load(std::memory_order_acquire);      \
-      if (key == 0) {                                                          \
-        return 0;                                                              \
-      }                                                                        \
-      return fire_callback(key, a, b, c, d);                                   \
-    }
 #endif
 
-TRAMPOLINE_LIST(DEFINE_TRAMPOLINE)
+// One trampoline per slot index.  Each instantiation is a distinct function
+// with its own address — that's what the host hands the sandboxed library as
+// the callback target.  System V x86_64 ABI matches the C calling
+// convention, so no extern "C" needed; the unused trailing args are
+// harmless when the library calls through with fewer arguments.
+template <size_t I>
+static int64_t trampoline_impl(int64_t a, int64_t b, int64_t c, int64_t d)
+{
+  if (!g_callback_keys) {
+    return 0;
+  }
+#if defined(RLBOX_TRANSPORT_RPCLIB)
+  if (!g_callback_client) {
+    return 0;
+  }
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+  if (g_callback_fd < 0) {
+    return 0;
+  }
+#endif
+  uintptr_t key = g_callback_keys[I].load(std::memory_order_acquire);
+  if (key == 0) {
+    return 0;
+  }
+#if defined(RLBOX_TRANSPORT_RPCLIB)
+  std::vector<int64_t> args = { a, b, c, d };
+  auto res = g_callback_client->call("trigger_callback", key, args);
+  return res.as<int64_t>();
+#elif defined(RLBOX_TRANSPORT_CAPNP)
+  return fire_callback(key, a, b, c, d);
+#else
+  (void)a; (void)b; (void)c; (void)d;
+  return 0;
+#endif
+}
 
-#define TRAMPOLINE_PTR(i) (void*)trampoline_##i,
-static void* g_trampoline_table[] = { TRAMPOLINE_LIST(TRAMPOLINE_PTR) };
+template <size_t... Is>
+static std::array<void*, sizeof...(Is)> make_trampoline_table(
+  std::index_sequence<Is...>)
+{
+  return { reinterpret_cast<void*>(&trampoline_impl<Is>)... };
+}
+
+static const std::array<void*, k_callback_slots> g_trampoline_table =
+  make_trampoline_table(std::make_index_sequence<k_callback_slots>{});
 
 extern "C"
 {

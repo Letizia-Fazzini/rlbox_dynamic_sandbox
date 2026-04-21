@@ -1,43 +1,36 @@
-# bench/ — sandbox benchmark harness
+# bench/ — sandbox backend benchmark harness
 
-Compares three sandboxing backends on the same workload for a chosen library (zlib or libjpeg, default: **jpeg**):
+Drives every supported test library (currently zlib, libjpeg) across the
+three sandbox backends and emits CSVs under `bench/results/`.
 
-- **native** — stock library, via `bench_native` in the library's build dir.
-- **wasm2c** — RLBox wasm2c sandbox, via `test/<lib>-testing/build/main`.
-- **process** — this repo's process sandbox, via `test/<lib>-testing/build/main_process`.
+## Layout
 
-Binaries may print a `COMPRESSION_MS=…` line; the driver parses it (plus its own wall-clock wrapper), writes a CSV, and the plot script produces graphs. If no `COMPRESSION_MS=` line is printed, wall-clock time is used and noted in the summary.
+- `run_benchmarks.py` — unified dispatcher (`zlib`, `jpeg`, or both)
+- `run_zlib_benchmarks.py` — zlib suite (sizes × levels × backends, incl. meta)
+- `run_jpeg_benchmarks.py` — libjpeg suite (qualities × backends)
+- `plot_results.py` — render plots from a CSV (auto-detects zlib vs jpeg)
+- `results/` — generated CSVs (auto-created)
+- `plots/` — generated PNGs (auto-created)
 
-## One-shot run
+## Quick start
 
 ```bash
-# 1. Build the wasm2c variant.  Replace <lib> with zlib or jpeg.
-cd test/<lib>-testing
-cmake -DCMAKE_BUILD_TYPE=Release -S . -B build && cmake --build build --parallel
-
-# 2. Build a process variant per transport.  Each gets its own dir; the bench
-#    driver looks for build_rpclib/ and build_capnp/ by default.
-cmake -DCMAKE_BUILD_TYPE=Release -DRLBOX_TRANSPORT=rpclib -S . -B build_rpclib \
-  && cmake --build build_rpclib --parallel
-cmake -DCMAKE_BUILD_TYPE=Release -DRLBOX_TRANSPORT=capnp -S . -B build_capnp \
-  && cmake --build build_capnp --parallel
-
-# 3. Drive the benchmark.
-#    jpeg default: sizes=256K,1M,4M; levels=90,50,25,10; 3 iters.
-#    zlib default: sizes=256K,1M,4M; levels=1,6,9;       3 iters.
-cd ../../bench
-python3 run_benchmarks.py --library jpeg   # or --library zlib
-
-# 4. Render plots.
-python3 plot_results.py
+# Build each test dir first; see test/<lib>-testing/ READMEs.
+cd bench
+python3 run_benchmarks.py                  # runs everything
+python3 run_benchmarks.py zlib             # just zlib
+python3 run_benchmarks.py --iters 5 jpeg   # just jpeg, 5 iters
 ```
 
-Output lands in `bench/results.csv` and `bench/plots/*.png`.
+Per-suite flags (sizes, levels, qualities, `--meta-policies`, etc.) live on
+the individual runners — invoke them directly:
 
-## Flags
+```bash
+python3 run_zlib_benchmarks.py --sizes 1m,16m --levels 6 --meta-policies process,wasm,adaptive
+python3 run_jpeg_benchmarks.py --qualities 25,75
+```
 
-`run_benchmarks.py`:
-
+Unified Dispatcher Flags:
 - `--library {zlib,jpeg}` — library to benchmark (default: `jpeg`). Controls default build paths, default levels, and input-file staging logic.
 - `--wasm2c-build-dir PATH` — default `test/<library>-testing/build`.
 - `--process-builds LIST` — comma-separated `label:path` or bare `subdir` (resolved under `test/<library>-testing/`). Default: `process_rpclib` + `process_capnp`.
@@ -46,10 +39,15 @@ Output lands in `bench/results.csv` and `bench/plots/*.png`.
 - `--iters N` — iterations per (backend, size, level). Median is used for plotting.
 - `--no-wasm2c` / `--no-process` — skip a backend (e.g. if only one is built).
 
-`plot_results.py`:
+## What the sandbox mains measure
 
-- `--csv PATH` — default `results.csv`.
-- `--out-dir PATH` — default `plots/`.
+`main.cpp` and `main_process.cpp` (both libs) emit `COMPRESSION_MS=…` for
+the sandboxed compression loop — everything that crosses the sandbox
+boundary, including `rlbox::memcpy`, `malloc_in_sandbox`, `invoke_sandbox_function`,
+`copy_and_verify`, and `free_in_sandbox`. `main_meta` emits `SANDBOX_MS=…`;
+the driver accepts both.
+
+For zlib, `bench_native` gives a stock-libz reference for the same input.
 
 ## Inputs
 
@@ -77,3 +75,6 @@ If a binary prints `COMPRESSION_MS=<value>` to stdout, that in-binary timing is 
 - The sandbox mains do a fair amount of correctness checking (copy-and-verify). That work is part of the sandboxing cost and is included in reported timing intentionally.
 - `bench_native` and the sandbox mains may produce side files (`compressed.jpeg`, `compressed.txt`, etc.) — harmless; they are overwritten each run.
 - The process backend forks a child per `invoke_sandbox_function`. That cost is per-call; many small chunks amortize worse than a few large ones. The input-size sweep surfaces this effect.
+- The mains do copy-and-verify on every chunk — that cost is part of
+  sandboxing and stays in `COMPRESSION_MS` intentionally.
+

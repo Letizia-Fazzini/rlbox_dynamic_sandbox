@@ -109,6 +109,9 @@ int main(int argc, char const *argv[]) {
   sandbox.invoke_sandbox_function(jpeg_set_defaults, cinfo);
   sandbox.invoke_sandbox_function(jpeg_set_quality, cinfo, quality, true);
 
+  double t_sandbox_ms = 0.0, t0;
+  t0 = monotonic_ms();
+
   //begin compression cycle
   double t_sandbox_ms = 0.0, t0;
 
@@ -164,6 +167,8 @@ int main(int argc, char const *argv[]) {
 
   printf("COMPRESSION_MS=%.3f\n", t_sandbox_ms);
 
+  t_sandbox_ms += monotonic_ms() - t0;
+
   //destroy jpeg object
   sandbox.invoke_sandbox_function(jpeg_destroy_compress, cinfo);
 
@@ -189,6 +194,8 @@ int main(int argc, char const *argv[]) {
 
   // destroy sandbox
   sandbox.destroy_sandbox();
+
+  printf("COMPRESSION_MS=%.3f\n", t_sandbox_ms);
 
   return 0;
 }
