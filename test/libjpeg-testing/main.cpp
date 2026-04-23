@@ -26,12 +26,9 @@ static double monotonic_ms()
 #include "jpeg.wasm.h"
 #include "rlbox.hpp"
 #include "rlbox_wasm2c_sandbox.hpp"
-#include "jpeglib.h"
-#include "jpeg_structs.h"
+#include "turbojpeg.h"
 
 using namespace rlbox;
-
-rlbox_load_structs_from_library(jpeg);
 
 // Define base type for libjpeg-turbo using the wasm2c sandbox
 RLBOX_DEFINE_BASE_TYPES_FOR(jpeg, wasm2c);
@@ -44,48 +41,23 @@ int main(int argc, char const *argv[]) {
     quality = std::stoi(argv[1]);
   }
 
-  int batch_size = 1;
-  if(argc>2) {
-    batch_size = std::stoi(argv[2]);
-    if(batch_size < 1) batch_size = 1;
-  }
-
   // Declare and create a new sandbox
   rlbox_sandbox_jpeg sandbox;
   sandbox.create_sandbox();
 
-  //put input stream inside sandbox
+  //put input stream inside sandbox as a flat packed pixel buffer
   FILE* source = fopen("test_data.txt", "r");
   int image_width, image_height, image_channels;
   fscanf(source, "%d %d %d", &image_width, &image_height, &image_channels);
-  int row_stride = image_width * image_channels * sizeof(JSAMPLE);
+  int row_stride = image_width * image_channels;
 
-  auto sandboxSource = sandbox.malloc_in_sandbox<JSAMPROW>(image_height);
-
-  for(int i = 0; i < image_height; i++) {
-
-    JSAMPLE* row = (JSAMPLE*)malloc(row_stride);
-    for (int j = 0; j < row_stride; j++) {
-      int val;
-      fscanf(source, "%d", &val);
-      row[j] = (JSAMPLE)val;
-    }
-
-    auto sandboxedRow = sandbox.malloc_in_sandbox<JSAMPLE>(image_width * 3);
-    rlbox::memcpy(sandbox, sandboxedRow, row, row_stride);
-    free(row);
-
-    sandboxSource[i] = sandboxedRow;
+  auto sandboxSrc = sandbox.malloc_in_sandbox<unsigned char>(image_height * row_stride);
+  for (int i = 0; i < image_height * row_stride; i++) {
+    int val;
+    fscanf(source, "%d", &val);
+    sandboxSrc[i] = (unsigned char)val;
   }
-
-  //allocate libjpeg objects in sandbox
-  auto cinfo = sandbox.malloc_in_sandbox<jpeg_compress_struct>();
-  auto jerr = sandbox.malloc_in_sandbox<jpeg_error_mgr>();  
-
-  auto returnedErr = sandbox.invoke_sandbox_function(jpeg_std_error, jerr);
-  cinfo->err = returnedErr;
-
-  sandbox.invoke_sandbox_function(jpeg_CreateCompress, cinfo, JPEG_LIB_VERSION, (size_t)sizeof(rlbox::Sbx_jpeg_jpeg_compress_struct<rlbox_wasm2c_sandbox>));
+  fclose(source);
 
   //declare output file
   FILE* destinationFile;
@@ -94,83 +66,38 @@ int main(int argc, char const *argv[]) {
     exit(1);
   }
 
-  //set up output stream inside sandbox
+  //set up output buffer pointers inside sandbox
   auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
   *outBuffer = nullptr;
   auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
   *outSize = 0;
-  sandbox.invoke_sandbox_function(jpeg_mem_dest, cinfo, outBuffer, outSize);
 
-  //set parmeters for compression
-  cinfo->image_width = image_width;
-  cinfo->image_height = image_height;
-  cinfo->input_components = image_channels;
-  cinfo->in_color_space = (int)JCS_RGB;
+  double t_start = monotonic_ms();
+  auto tjHandle = sandbox.invoke_sandbox_function(tjInitCompress);
 
-  sandbox.invoke_sandbox_function(jpeg_set_defaults, cinfo);
-  sandbox.invoke_sandbox_function(jpeg_set_quality, cinfo, quality, true);
-
-  double t_sandbox_ms = 0.0, t0;
-  t0 = monotonic_ms();
-
-  //begin compression cycle
-  double t_sandbox_ms = 0.0, t0;
-
-  t0 = monotonic_ms();
-  sandbox.invoke_sandbox_function(jpeg_start_compress, cinfo, TRUE);
-  t_sandbox_ms += monotonic_ms() - t0;
-
-  //write jpeg data to buffer in batches
-  auto batchRows = sandbox.malloc_in_sandbox<JSAMPROW>(batch_size);
-  auto verifiedNextScanline = cinfo->next_scanline.copy_and_verify([](int lines){
-    release_assert(lines>=0, "Number of scanlines read so far must be non-negative");
-    return lines;
-  });
-  auto verifiedImageHeight = cinfo->image_height.copy_and_verify([verifiedNextScanline](int height){
-    release_assert(height>=0, "Image height must be non-negative");
-    release_assert(height>=verifiedNextScanline, "Cannot have written more scanlines than total height");
-    return height;
+  auto compress_ret = sandbox.invoke_sandbox_function(
+    tjCompress2,
+    tjHandle,
+    sandboxSrc,
+    image_width,
+    row_stride,
+    image_height,
+    TJPF_RGB,
+    outBuffer,
+    outSize,
+    TJSAMP_444,
+    quality,
+    0
+  );
+  compress_ret.copy_and_verify([](int ret) {
+    release_assert(ret == 0, "tjCompress2 failed");
+    return ret;
   });
 
-  while (verifiedNextScanline < verifiedImageHeight) {
+  sandbox.invoke_sandbox_function(tjDestroy, tjHandle);
+  printf("COMPRESSION_MS=%.3f\n", monotonic_ms() - t_start);
 
-    int remaining = verifiedImageHeight - verifiedNextScanline;
-    int this_batch = (remaining < batch_size) ? remaining : batch_size;
-
-    for (int b = 0; b < this_batch; b++) {
-      batchRows[b] = sandboxSource[verifiedNextScanline + b];
-    }
-
-    t0 = monotonic_ms();
-    (void) sandbox.invoke_sandbox_function(jpeg_write_scanlines, cinfo, batchRows, this_batch);
-    t_sandbox_ms += monotonic_ms() - t0;
-
-    verifiedNextScanline = cinfo->next_scanline.copy_and_verify([](int lines){
-      release_assert(lines>=0, "Number of scanlines read so far must be non-negative");
-      return lines;
-    });
-    verifiedImageHeight = cinfo->image_height.copy_and_verify([verifiedNextScanline](int height){
-      release_assert(height>=0, "Image height must be non-negative");
-      release_assert(height>=verifiedNextScanline, "Cannot have written more scanlines than total height");
-      return height;
-    });
-  }
-
-  // complete compression cycle
-  t0 = monotonic_ms();
-  sandbox.invoke_sandbox_function(jpeg_finish_compress, cinfo);
-  t_sandbox_ms += monotonic_ms() - t0;
-
-  printf("COMPRESSION_MS=%.3f\n", t_sandbox_ms);
-
-  t_sandbox_ms += monotonic_ms() - t0;
-
-  //destroy jpeg object
-  sandbox.invoke_sandbox_function(jpeg_destroy_compress, cinfo);
-
-  //free sandbox resources
-  sandbox.free_in_sandbox(sandboxSource);
-  sandbox.free_in_sandbox(batchRows);
+  sandbox.free_in_sandbox(sandboxSrc);
 
   //copy data from sandbox buffer "outBuffer" to "compressed.jpeg"
   auto verifiedSizePtr = outSize.copy_and_verify([](std::unique_ptr<unsigned long> size) {
@@ -188,10 +115,12 @@ int main(int argc, char const *argv[]) {
   fwrite(localBuffer.get(), 1, verifiedSize, destinationFile);
   fclose(destinationFile);
 
+  sandbox.free_in_sandbox(*outBuffer);
+  sandbox.free_in_sandbox(outBuffer);
+  sandbox.free_in_sandbox(outSize);
+
   // destroy sandbox
   sandbox.destroy_sandbox();
-
-  printf("COMPRESSION_MS=%.3f\n", t_sandbox_ms);
 
   return 0;
 }

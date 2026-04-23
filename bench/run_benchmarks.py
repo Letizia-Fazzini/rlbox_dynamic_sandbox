@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-TODO: condense summary
 Drive the benchmark across three backends for a chosen library:
     - native:  bench_native (stock libz or libjpeg)
     - wasm2c:  test/<lib>-testing/build/main (RLBox wasm2c sandbox)
@@ -24,18 +23,6 @@ Both test_data.txt files have a header line that must appear exactly once; only
 the body is repeated to reach the target size.  For libjpeg the header encodes
 image dimensions (W H C) and is rewritten to reflect the actual number of rows
 included, so the C binaries always read a consistent file.
-Unified driver for all benchmark suites.
-
-Usage:
-    run_benchmarks.py                 # runs every suite
-    run_benchmarks.py zlib            # runs only zlib
-    run_benchmarks.py zlib jpeg       # runs both explicitly
-
-Each suite is implemented by its own script (run_zlib_benchmarks.py,
-run_jpeg_benchmarks.py); this wrapper just dispatches to them and
-surfaces a few shared knobs (--iters, --out-dir). For suite-specific
-flags (sizes, levels, qualities, meta policies, etc.) invoke the
-corresponding run_<suite>_benchmarks.py directly.
 """
 from __future__ import annotations
 
@@ -47,7 +34,9 @@ import shutil
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Optional
 
 BENCH_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BENCH_DIR.parent
@@ -269,9 +258,6 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=3,
                     help="iterations per (backend, size, level)")
     ap.add_argument("--out", type=Path, default=BENCH_DIR / "results.csv")
-    ap.add_argument("--batch-size", type=int, default=16,
-                    help="number of scanlines per jpeg_write_scanlines call "
-                         "(default: 64; only used for jpeg)")
     ap.add_argument("--no-wasm2c", action="store_true",
                     help="skip the wasm2c backend (e.g. if not built)")
     ap.add_argument("--no-process", action="store_true",
@@ -290,9 +276,6 @@ def main() -> int:
     )
     sizes = parse_sizes(args.sizes)
     levels = parse_ints(args.levels if args.levels is not None else default_levels)
-    batch_size = args.batch_size
-    # Extra args appended to every binary invocation (batch size for jpeg)
-    extra_args = [str(batch_size)] if library is Library.JPEG else []
     source_data = testing_dir / "test_data.txt"
     # -------------------------------------------------------------------------
 
@@ -361,7 +344,7 @@ def main() -> int:
                 for label, build_dir in process_builds:
                     rows = run_config(
                         label,
-                        [str(build_dir / "main_process"), str(level)] + extra_args,
+                        [str(build_dir / "main_process"), str(level)],
                         cwd=build_dir,
                         size=size,
                         level=level,
@@ -374,7 +357,7 @@ def main() -> int:
                 # seeding (test_data.txt is identical across them).
                 rows = run_config(
                     "native",
-                    [str(bench_native), str(level)] + extra_args,
+                    [str(bench_native), str(level)],
                     cwd=write_dirs[0],
                     size=size,
                     level=level,
@@ -386,7 +369,7 @@ def main() -> int:
                 if not args.no_wasm2c:
                     rows = run_config(
                         "wasm2c",
-                        [str(main_bin), str(level)] + extra_args,
+                        [str(main_bin), str(level)],
                         cwd=wasm2c_build_dir,
                         size=size,
                         level=level,
@@ -435,56 +418,6 @@ def main() -> int:
         print(f"{backend:<16} {size_bytes:<10} {level:<7} {t:>10.2f}",
               file=sys.stderr)
 
-
-SUITES = {
-    "zlib": BENCH_DIR / "run_zlib_benchmarks.py",
-    "jpeg": BENCH_DIR / "run_jpeg_benchmarks.py",
-}
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    ap.add_argument("suites", nargs="*", choices=list(SUITES),
-                    help=f"suites to run (default: all — {', '.join(SUITES)})")
-    ap.add_argument("--iters", type=int, default=None,
-                    help="iterations per config; forwarded to every suite")
-    ap.add_argument("--out-dir", type=Path,
-                    default=BENCH_DIR / "results",
-                    help="directory to write CSVs into (default: %(default)s)")
-    ap.add_argument("--meta-policies", type=str, default=None,
-                    help="forwarded to zlib suite (ignored for jpeg)")
-    ap.add_argument("--shape", type=str, default=None,
-                    help="forwarded to each suite (e.g. `loop`, `stress`, "
-                         "or `loop,stress`)")
-    args = ap.parse_args()
-
-    picked = args.suites or list(SUITES.keys())
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    failures: list[str] = []
-    for suite in picked:
-        script = SUITES[suite]
-        cmd = [sys.executable, str(script),
-               "--out", str(args.out_dir / f"{suite}.csv")]
-        if args.iters is not None:
-            cmd += ["--iters", str(args.iters)]
-        if suite == "zlib" and args.meta_policies:
-            cmd += ["--meta-policies", args.meta_policies]
-        if args.shape:
-            cmd += ["--shape", args.shape]
-        print(f"\n[run_benchmarks] === {suite} ===", file=sys.stderr)
-        print(f"[run_benchmarks] {' '.join(cmd)}", file=sys.stderr)
-        rc = subprocess.call(cmd)
-        if rc != 0:
-            failures.append(f"{suite} (exit {rc})")
-
-    if failures:
-        print(f"\n[run_benchmarks] FAILED: {', '.join(failures)}", file=sys.stderr)
-        return 1
-    print(f"\n[run_benchmarks] all suites OK -> {args.out_dir}", file=sys.stderr)
     return 0
 
 

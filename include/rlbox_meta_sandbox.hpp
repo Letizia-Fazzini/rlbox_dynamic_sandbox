@@ -95,6 +95,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <time.h>
 #include <type_traits>
@@ -149,13 +150,11 @@ struct meta_policy_context
   double proc_median_ms = 0.0;
   double wasm_median_ms = 0.0;
 
-  // Populated only on the alloc path (func_name == nullptr).  alloc_size
-  // is the bytes requested; proc_wins/wasm_wins count symbols (that
-  // resolve on both backends and have at least one sample on each)
-  // whose current median is lower on the respective side.  A weak signal
-  // — alloc-time routing is a guess because the consumer symbol isn't
-  // known yet — but it's the only global head-to-head signal available
-  // without per-call hints.  Zero on the invoke path.
+  // Populated on both the alloc path (func_name == nullptr) and the
+  // named-invoke slow path.  alloc_size is the bytes requested on the
+  // alloc path (zero on the invoke path); proc_wins/wasm_wins count
+  // symbols that resolve on both backends and have at least one sample
+  // on each side, with the lower median on the respective side.
   size_t alloc_size = 0;
   size_t proc_wins = 0;
   size_t wasm_wins = 0;
@@ -191,45 +190,32 @@ using meta_struct_translator_fn = std::function<meta_struct_translation(
   const char* symbol,
   uintptr_t host_ptr)>;
 
-// Adaptive policy: explore each backend at least `explore_per_backend`
-// times per symbol, then route each subsequent call to whichever
-// backend has the lower median.  The allocation path (M8) uses the
-// aggregate proc_wins/wasm_wins signal: once wasm is winning more
-// symbols than process across the cache, new allocations follow, and
-// subsequent pointer-carrying invokes get pinned there via the
-// ownership-override.
+// Adaptive policy with a global `current_best` backend.
 //
-// Two bootstrap knobs beyond pure M8 behavior:
+// Every invoke — alloc or named — dispatches to `current_best` and only
+// updates it *afterwards*, so the next caller sees the revised choice.
+// Named invokes drive the update; alloc invokes just follow whatever
+// the named invokes have decided.
 //
-//   `alloc_warmup` (M10 follow-up, 1b in the roadmap): the first N
-//   allocations to hit the alloc path with no head-to-head signal go
-//   to wasm instead of the safe-default process.  Rationale: many
-//   workloads allocate before any invoke has run (zlib allocates a
-//   z_stream before any deflate call), so without this probe the
-//   adaptive policy pins the entire session to process via ownership-
-//   wins — you never get to observe wasm's latency and wasm_wins
-//   stays 0 forever.  Wasm-probe bootstrap means those first allocs
-//   pin consumer invokes to wasm, populating wasm's rings; subsequent
-//   allocs use the normal win-count routing.  If wasm is actually
-//   slower, the ownership pin on those consumer invokes makes the
-//   workload eat the probe cost — priced in for the chance to flip.
-//   Set to 0 to revert to pure M8 behavior (tie → process).
+// Update rule (runs only after a named invoke):
+//   - During the first `alloc_warmup` named invocations (global, not
+//     per-symbol): pick randomly.  This ensures both backends get early
+//     samples before any routing commitment is made.
+//   - After warmup, if `reexplore_period` is non-zero: every Nth named
+//     invoke picks randomly again to detect drift.
+//   - Otherwise, if proc_wins == wasm_wins (including both zero, meaning
+//     no symbol has samples on both sides yet): pick randomly.
+//   - Otherwise: pick the backend with more wins.
 //
-//   `reexplore_period` (M7 follow-up): once both backends have been
-//   explored on a symbol, every Nth invoke routes to whichever side
-//   currently has fewer samples in its ring, refreshing the data.
-//   Covers drift scenarios (e.g. fork-cost amortization kicking in
-//   only after the first several hundred invokes) where a committed
-//   pick could otherwise stay committed indefinitely despite the
-//   other backend getting faster.  0 disables; default also 0 because
-//   deterministic bench repeatability matters more than drift
-//   detection for the current workloads.  When non-zero, every Nth
-//   post-exploration invoke probes the backend with fewer ring
-//   samples (median itself is already a lifetime-lagged signal, but
-//   this keeps the *sample count* symmetric so one backend's median
-//   doesn't go arbitrarily stale).
-inline meta_policy_fn make_adaptive_policy(size_t explore_per_backend = 3,
-                                           size_t alloc_warmup = 1,
+// Per-symbol latency rings are still populated on every timed invoke so
+// the proc_wins/wasm_wins aggregate that the policy reads (via
+// meta_policy_context, populated by snapshot_alloc_wins before policy()
+// is called) is always current.
+//
+// If current_best is wasm but the symbol being dispatched has no wasm
+// binding, process is used for that single call only; current_best is
+// updated normally using the wins signal.
+inline meta_policy_fn make_adaptive_policy(size_t alloc_warmup = 1,
                                            size_t reexplore_period = 0)
 {
   // Per-policy state — lambda captures a shared_ptr so copies of the
@@ -237,57 +223,63 @@ inline meta_policy_fn make_adaptive_policy(size_t explore_per_backend = 3,
   // set_policy) share the same counters.
   struct adaptive_state
   {
-    size_t alloc_no_signal = 0;  // allocs seen with wins all-zero
-    size_t invoke_post_explore = 0;  // invokes seen after both sides explored
+    meta_backend current_best = meta_backend::process;
+    size_t named_invoke_count = 0;
+    std::mt19937 rng{ std::random_device{}() };
+    std::uniform_int_distribution<int> dist{ 0, 1 };
   };
   auto state = std::make_shared<adaptive_state>();
-  return [explore_per_backend, alloc_warmup, reexplore_period, state](
+  return [alloc_warmup, reexplore_period, state](
            const meta_policy_context& ctx) -> meta_backend {
     if (ctx.func_name == nullptr) {
-      // Alloc path: bias toward whichever backend is winning more
-      // head-to-head symbol races.  Strict inequality required for
-      // each side — ties fall through to the warmup / safe-default
-      // branch.
-      if (ctx.wasm_wins > ctx.proc_wins) {
-        return meta_backend::wasm;
-      }
-      if (ctx.proc_wins > ctx.wasm_wins) {
-        return meta_backend::process;
-      }
-      // No head-to-head signal yet.  Probe wasm for the first
-      // `alloc_warmup` allocs to seed its latency rings; after that,
-      // fall back to process.
-      size_t n = state->alloc_no_signal++;
-      if (n < alloc_warmup) {
-        return meta_backend::wasm;
-      }
-      return meta_backend::process;
+      // Alloc path: just follow current_best; named invokes drive the
+      // update so allocations are always consistent with invokes.
+      return state->current_best;
     }
-    if (!ctx.has_wasm) {
-      return meta_backend::process;
+
+    // Named-invoke path.
+    // Step 1: return current_best to the caller (dispatch happens now).
+    // If current_best is wasm but this symbol has no wasm binding, fall
+    // back to process for this one call only — the update below still
+    // uses the normal wins logic so current_best isn't permanently forced.
+    meta_backend result = state->current_best;
+    if (result == meta_backend::wasm && !ctx.has_wasm) {
+      result = meta_backend::process;
     }
-    if (ctx.proc_samples < explore_per_backend) {
-      return meta_backend::process;
+
+    // Step 2: update current_best for subsequent dispatches.
+    size_t n = state->named_invoke_count++;
+    meta_backend next;
+    auto random_backend = [&]() {
+      return state->dist(state->rng) == 0 ? meta_backend::process
+                                          : meta_backend::wasm;
+    };
+    if (n < alloc_warmup) {
+      // Warmup: randomise so both backends get early samples.
+      next = random_backend();
+    } else if (reexplore_period != 0 &&
+               ((n - alloc_warmup) % reexplore_period) == 0) {
+      // Periodic re-exploration: randomise to detect drift.
+      next = random_backend();
+    } else if (ctx.proc_wins == ctx.wasm_wins) {
+      // Tie (includes both-zero: no head-to-head signal yet): randomise.
+      next = random_backend();
+    } else if (ctx.proc_wins > ctx.wasm_wins) {
+      next = meta_backend::process;
+    } else {
+      next = meta_backend::wasm;
     }
-    if (ctx.wasm_samples < explore_per_backend) {
-      return meta_backend::wasm;
-    }
-    // Both sides explored; optionally probe the current loser every
-    // `reexplore_period` invokes so a winning backend's lead stays
-    // honest — if the other backend gets faster later (fork
-    // amortization, cache warmup, whatever) its ring still refreshes
-    // rather than going arbitrarily stale.
-    if (reexplore_period != 0) {
-      size_t n = state->invoke_post_explore++;
-      if ((n % reexplore_period) == 0) {
-        return ctx.proc_median_ms <= ctx.wasm_median_ms ? meta_backend::wasm
-                                                        : meta_backend::process;
-      }
-    }
-    return ctx.proc_median_ms <= ctx.wasm_median_ms ? meta_backend::process
-                                                    : meta_backend::wasm;
+    state->current_best = next;
+
+    return result;
   };
 }
+
+// Return-type extractor for a raw C function type (e.g. void*(void) → void*).
+// Used in impl_invoke_with_func_ptr to detect pointer-returning functions and
+// register their results in alloc_owner for ownership tracking.
+template<typename F> struct meta_fn_ret;
+template<typename R, typename... A> struct meta_fn_ret<R(A...)> { using type = R; };
 
 class rlbox_meta_sandbox
 {
@@ -832,15 +824,40 @@ public:
       meta_scope ms{ tl_invoking_meta };
       tl_invoking_meta = this;
       cleanup_runner cr{ &struct_cleanups };
-      return wasm_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
-        reinterpret_cast<T_Converted*>(rec->wasm_sym),
-        translate(std::forward<T_Args>(params))...);
+      using T_Ret_pin2 = typename meta_fn_ret<T>::type;
+      if constexpr (std::is_pointer_v<T_Ret_pin2>) {
+        auto raw = wasm_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
+          reinterpret_cast<T_Converted*>(rec->wasm_sym),
+          translate(std::forward<T_Args>(params))...);
+        if (raw != 0) {
+          T_PointerType tagged = tag_wasm(static_cast<T_PointerType>(raw));
+          { std::lock_guard<std::mutex> g(alloc_mutex); alloc_owner.emplace(tagged, meta_backend::wasm); }
+          return tagged;
+        }
+        return static_cast<T_PointerType>(0);
+      } else {
+        return wasm_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
+          reinterpret_cast<T_Converted*>(rec->wasm_sym),
+          translate(std::forward<T_Args>(params))...);
+      }
     }
     if (pin == 1) {
       invokes_on_process_++;
-      return process_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
-        reinterpret_cast<T_Converted*>(rec->process_sym),
-        std::forward<T_Args>(params)...);
+      using T_Ret_pin1 = typename meta_fn_ret<T>::type;
+      if constexpr (std::is_pointer_v<T_Ret_pin1>) {
+        auto result = process_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
+          reinterpret_cast<T_Converted*>(rec->process_sym),
+          std::forward<T_Args>(params)...);
+        if (result != 0) {
+          std::lock_guard<std::mutex> g(alloc_mutex);
+          alloc_owner.emplace(result, meta_backend::process);
+        }
+        return result;
+      } else {
+        return process_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
+          reinterpret_cast<T_Converted*>(rec->process_sym),
+          std::forward<T_Args>(params)...);
+      }
     }
 
     // Slow path: full policy consultation, ownership override, timing.
@@ -863,6 +880,7 @@ public:
       ctx.proc_median_ms = rec->process_latency.median();
       ctx.wasm_median_ms = rec->wasm_latency.median();
     }
+    snapshot_alloc_wins(ctx.proc_wins, ctx.wasm_wins);
     meta_backend choice = policy(ctx);
 
     // Pointer-ownership override: if any pointer-typed arg belongs to a
@@ -1020,17 +1038,42 @@ public:
       sample_pusher sp{ rec, meta_backend::wasm, monotonic_ms(),
                         pin_threshold_ };
       cleanup_runner cr{ &struct_cleanups };
-      return wasm_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
-        reinterpret_cast<T_Converted*>(rec->wasm_sym),
-        translate(std::forward<T_Args>(params))...);
+      using T_Ret_wasm = typename meta_fn_ret<T>::type;
+      if constexpr (std::is_pointer_v<T_Ret_wasm>) {
+        auto raw = wasm_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
+          reinterpret_cast<T_Converted*>(rec->wasm_sym),
+          translate(std::forward<T_Args>(params))...);
+        if (raw != 0) {
+          T_PointerType tagged = tag_wasm(static_cast<T_PointerType>(raw));
+          { std::lock_guard<std::mutex> g(alloc_mutex); alloc_owner.emplace(tagged, meta_backend::wasm); }
+          return tagged;
+        }
+        return static_cast<T_PointerType>(0);
+      } else {
+        return wasm_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
+          reinterpret_cast<T_Converted*>(rec->wasm_sym),
+          translate(std::forward<T_Args>(params))...);
+      }
     }
 
     invokes_on_process_++;
     sample_pusher sp{ rec, meta_backend::process, monotonic_ms(),
                       pin_threshold_ };
-    return process_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
-      reinterpret_cast<T_Converted*>(rec->process_sym),
-      std::forward<T_Args>(params)...);
+    using T_Ret_proc = typename meta_fn_ret<T>::type;
+    if constexpr (std::is_pointer_v<T_Ret_proc>) {
+      auto result = process_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
+        reinterpret_cast<T_Converted*>(rec->process_sym),
+        std::forward<T_Args>(params)...);
+      if (result != 0) {
+        std::lock_guard<std::mutex> g(alloc_mutex);
+        alloc_owner.emplace(result, meta_backend::process);
+      }
+      return result;
+    } else {
+      return process_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
+        reinterpret_cast<T_Converted*>(rec->process_sym),
+        std::forward<T_Args>(params)...);
+    }
   }
 
   // Walk the symbol cache and count, across all symbols that resolve

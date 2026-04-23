@@ -16,17 +16,23 @@ static double monotonic_ms()
 
 // We're going to use RLBox in a single-threaded environment.
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
+// The meta-sandbox resolves symbols dynamically per-backend at dispatch time;
+// do NOT define RLBOX_USE_STATIC_CALLS() here (see rlbox_meta_sandbox.hpp).
+// The wasm2c module name and generated header must be set up before the meta
+// include so the meta header (which re-includes rlbox_wasm2c_sandbox.hpp
+// internally) can see them.
+#define RLBOX_WASM2C_MODULE_NAME jpeg
 
-// Process sandbox uses dynamic symbol resolution via dlsym in the child —
-// no RLBOX_USE_STATIC_CALLS()
-
+// Include the produced header from wasm2c
+#include "jpeg.wasm.h"
 #include "rlbox.hpp"
-#include "rlbox_process_sandbox.hpp"
+#include "rlbox_meta_sandbox.hpp"
 #include "turbojpeg.h"
 
 using namespace rlbox;
 
-RLBOX_DEFINE_BASE_TYPES_FOR(jpeg, process);
+// Define base types for libjpeg-turbo using the meta (adaptive) sandbox
+RLBOX_DEFINE_BASE_TYPES_FOR(jpeg, meta);
 
 int main(int argc, char const *argv[]) {
 
@@ -36,8 +42,12 @@ int main(int argc, char const *argv[]) {
     quality = std::stoi(argv[1]);
   }
 
+  // Declare and create a new sandbox (both process and wasm backends)
   rlbox_sandbox_jpeg sandbox;
   sandbox.create_sandbox(JPEG_PROCESS_WRAPPER_PATH);
+  // Install the adaptive dispatch policy: explore each backend 3 times per
+  // symbol, then route to whichever has the lower median latency.
+  sandbox.get_sandbox_impl()->set_policy(rlbox::make_adaptive_policy());
 
   //put input stream inside sandbox as a flat packed pixel buffer
   FILE* source = fopen("test_data.txt", "r");
@@ -46,13 +56,10 @@ int main(int argc, char const *argv[]) {
   int row_stride = image_width * image_channels;
 
   auto sandboxSrc = sandbox.malloc_in_sandbox<unsigned char>(image_height * row_stride);
-
-  for(int i = 0; i < image_height; i++) {
-    for (int j = 0; j < row_stride; j++) {
-      int val;
-      fscanf(source, "%d", &val);
-      sandboxSrc[i * row_stride + j] = (unsigned char)val;
-    }
+  for (int i = 0; i < image_height * row_stride; i++) {
+    int val;
+    fscanf(source, "%d", &val);
+    sandboxSrc[i] = (unsigned char)val;
   }
   fclose(source);
 
@@ -69,7 +76,6 @@ int main(int argc, char const *argv[]) {
   auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
   *outSize = 0;
 
-  // TurboJPEG 3-call compression sequence
   double t_start = monotonic_ms();
   auto tjHandle = sandbox.invoke_sandbox_function(tjInitCompress);
 
@@ -78,12 +84,12 @@ int main(int argc, char const *argv[]) {
     tjHandle,
     sandboxSrc,
     image_width,
-    row_stride,          // pitch: bytes per row (tightly packed)
+    row_stride,
     image_height,
     TJPF_RGB,
     outBuffer,
     outSize,
-    TJSAMP_444,          // no chroma subsampling, matches JCS_RGB intent
+    TJSAMP_444,
     quality,
     0
   );
@@ -95,7 +101,6 @@ int main(int argc, char const *argv[]) {
   sandbox.invoke_sandbox_function(tjDestroy, tjHandle);
   printf("COMPRESSION_MS=%.3f\n", monotonic_ms() - t_start);
 
-  //free input buffer
   sandbox.free_in_sandbox(sandboxSrc);
 
   //copy data from sandbox buffer "outBuffer" to "compressed.jpeg"
@@ -114,7 +119,6 @@ int main(int argc, char const *argv[]) {
   fwrite(localBuffer.get(), 1, verifiedSize, destinationFile);
   fclose(destinationFile);
 
-  // free the TurboJPEG-allocated output buffer inside the sandbox
   sandbox.free_in_sandbox(*outBuffer);
   sandbox.free_in_sandbox(outBuffer);
   sandbox.free_in_sandbox(outSize);
@@ -124,3 +128,4 @@ int main(int argc, char const *argv[]) {
 
   return 0;
 }
+
