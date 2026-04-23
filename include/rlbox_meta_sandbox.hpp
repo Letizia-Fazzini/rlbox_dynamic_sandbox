@@ -39,11 +39,12 @@
 // over adaptive routing for the same reason it wins over any other
 // policy pick.
 // M8 extends meta_policy_context with an aggregate view for the alloc
-// path.  impl_malloc_in_sandbox snapshots the symbol cache and counts,
-// across all symbols that resolve on both sides, how many have a
-// lower median on process vs wasm ("wins").  make_adaptive_policy
-// routes allocations to the winning side, falling back to process
-// when there's no head-to-head signal yet.  The point is to break the
+// path.  impl_malloc_in_sandbox snapshots the symbol cache and sums,
+// across all symbols that resolve on both sides, the per-backend medians
+// (only symbols with at least one sample on each side contribute).
+// make_adaptive_policy routes allocations to the side with the lower
+// median sum, falling back to process when there's no head-to-head
+// signal yet.  The point is to break the
 // pre-M8 chain "alloc always on process → every pointer-carrying
 // invoke pinned to process via ownership-wins → wasm dispatch never
 // fires for libraries that allocate": once wasm is consistently
@@ -152,12 +153,12 @@ struct meta_policy_context
 
   // Populated on both the alloc path (func_name == nullptr) and the
   // named-invoke slow path.  alloc_size is the bytes requested on the
-  // alloc path (zero on the invoke path); proc_wins/wasm_wins count
-  // symbols that resolve on both backends and have at least one sample
-  // on each side, with the lower median on the respective side.
+  // alloc path (zero on the invoke path); proc_median_sum/wasm_median_sum
+  // are the sums of per-symbol medians across symbols that resolve on both
+  // backends and have at least one sample on each side.
   size_t alloc_size = 0;
-  size_t proc_wins = 0;
-  size_t wasm_wins = 0;
+  double proc_median_sum = 0.0;
+  double wasm_median_sum = 0.0;
 };
 
 using meta_policy_fn = std::function<meta_backend(const meta_policy_context&)>;
@@ -203,13 +204,13 @@ using meta_struct_translator_fn = std::function<meta_struct_translation(
 //     samples before any routing commitment is made.
 //   - After warmup, if `reexplore_period` is non-zero: every Nth named
 //     invoke picks randomly again to detect drift.
-//   - Otherwise, if proc_wins == wasm_wins (including both zero, meaning
-//     no symbol has samples on both sides yet): pick randomly.
-//   - Otherwise: pick the backend with more wins.
+//   - Otherwise, if proc_median_sum == wasm_median_sum (including both
+//     zero, meaning no symbol has samples on both sides yet): pick randomly.
+//   - Otherwise: pick the backend with the lower median sum.
 //
 // Per-symbol latency rings are still populated on every timed invoke so
-// the proc_wins/wasm_wins aggregate that the policy reads (via
-// meta_policy_context, populated by snapshot_alloc_wins before policy()
+// the proc_median_sum/wasm_median_sum aggregate that the policy reads (via
+// meta_policy_context, populated by snapshot_median_sums before policy()
 // is called) is always current.
 //
 // If current_best is wasm but the symbol being dispatched has no wasm
@@ -261,10 +262,10 @@ inline meta_policy_fn make_adaptive_policy(size_t alloc_warmup = 1,
                ((n - alloc_warmup) % reexplore_period) == 0) {
       // Periodic re-exploration: randomise to detect drift.
       next = random_backend();
-    } else if (ctx.proc_wins == ctx.wasm_wins) {
+    } else if (ctx.proc_median_sum == ctx.wasm_median_sum) {
       // Tie (includes both-zero: no head-to-head signal yet): randomise.
       next = random_backend();
-    } else if (ctx.proc_wins > ctx.wasm_wins) {
+    } else if (ctx.proc_median_sum < ctx.wasm_median_sum) {
       next = meta_backend::process;
     } else {
       next = meta_backend::wasm;
@@ -880,7 +881,7 @@ public:
       ctx.proc_median_ms = rec->process_latency.median();
       ctx.wasm_median_ms = rec->wasm_latency.median();
     }
-    snapshot_alloc_wins(ctx.proc_wins, ctx.wasm_wins);
+    snapshot_median_sums(ctx.proc_median_sum, ctx.wasm_median_sum);
     meta_backend choice = policy(ctx);
 
     // Pointer-ownership override: if any pointer-typed arg belongs to a
@@ -1085,10 +1086,10 @@ public:
   // individually, so we never nest the two locks.  Records live for
   // the sandbox's lifetime (symbol_cache only grows), so the raw
   // pointers captured here stay valid until destroy_sandbox.
-  void snapshot_alloc_wins(size_t& proc_wins, size_t& wasm_wins)
+  void snapshot_median_sums(double& proc_median_sum, double& wasm_median_sum)
   {
-    proc_wins = 0;
-    wasm_wins = 0;
+    proc_median_sum = 0.0;
+    wasm_median_sum = 0.0;
     std::vector<meta_symbol_record*> records;
     {
       std::lock_guard<std::mutex> g(symbol_cache_mutex);
@@ -1105,8 +1106,8 @@ public:
       if (rec->wasm_latency.size() == 0) continue;
       double pm = rec->process_latency.median();
       double wm = rec->wasm_latency.median();
-      if (pm <= wm) ++proc_wins;
-      else ++wasm_wins;
+      proc_median_sum += pm;
+      wasm_median_sum += wm;
     }
   }
 
@@ -1121,7 +1122,7 @@ public:
     meta_policy_context ctx{};
     ctx.func_name = nullptr;
     ctx.alloc_size = size;
-    snapshot_alloc_wins(ctx.proc_wins, ctx.wasm_wins);
+    snapshot_median_sums(ctx.proc_median_sum, ctx.wasm_median_sum);
     meta_backend choice = policy(ctx);
 
     T_PointerType p;

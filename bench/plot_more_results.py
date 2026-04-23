@@ -30,28 +30,28 @@ KNOWN_BACKEND_ORDER = [
     "native",
     "wasm2c",
     "process",
-    "process_rpclib",
     "process_capnp",
-    "rpclib",
+    "process_rpclib",
     "capnp",
+    "rpclib",
 ]
 KNOWN_COLORS = {
     "native": "#1f77b4",
     "wasm2c": "#ff7f0e",
     "process": "#2ca02c",
-    "process_rpclib": "#d62728",
     "process_capnp": "#9467bd",
-    "rpclib": "#d62728",
+    "process_rpclib": "#d62728",
     "capnp": "#9467bd",
+    "rpclib": "#d62728",
 }
 KNOWN_LABELS = {
     "native": "native zlib",
     "wasm2c": "RLBox wasm2c",
     "process": "RLBox process",
-    "process_rpclib": "process (rpclib)",
     "process_capnp": "process (capnp)",
-    "rpclib": "process (rpclib)",
+    "process_rpclib": "process (rpclib)",
     "capnp": "process (capnp)",
+    "rpclib": "process (rpclib)",
 }
 # Fallback palette for unknown backends.
 _FALLBACK_COLORS = [
@@ -152,7 +152,7 @@ def plot_time_vs_size(rows: list[dict], meds: dict, out_path: Path) -> None:
 
 
 def plot_overhead(rows: list[dict], meds: dict, out_path: Path) -> None:
-    sandbox_backends = [b for b in order_backends(rows) if b != "native"]
+    sandbox_backends = [b for b in order_backends(rows) if (b != "native" and b!="process_rpclib")]
     levels = sorted({r["level"] for r in rows})
     sizes = sorted({r["size_bytes"] for r in rows})
 
@@ -179,12 +179,12 @@ def plot_overhead(rows: list[dict], meds: dict, out_path: Path) -> None:
         ax.axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.5)
         ax.set_xticks(x)
         ax.set_xticklabels([human_size(s) for s in sizes])
-        ax.set_title(f"compression level {level}")
+        ax.set_title(f"quality level {level}")
         ax.set_xlabel("input size")
         ax.grid(True, axis="y", linestyle=":", alpha=0.5)
     axes[0][0].set_ylabel("slowdown vs native (×)")
     axes[0][-1].legend(loc="best")
-    fig.suptitle("sandbox overhead relative to native zlib")
+    fig.suptitle("sandbox overhead relative to native libjpeg-turbo")
     fig.tight_layout()
     fig.savefig(out_path, dpi=130)
     plt.close(fig)
@@ -218,7 +218,7 @@ def plot_throughput(rows: list[dict], meds: dict, out_path: Path) -> None:
             )
         ax.set_xticks(x)
         ax.set_xticklabels([human_size(s) for s in sizes])
-        ax.set_title(f"compression level {level}")
+        ax.set_title(f"quality level {level}")
         ax.set_xlabel("input size")
         ax.grid(True, axis="y", linestyle=":", alpha=0.5)
     axes[0][0].set_ylabel("throughput (MB/s)")

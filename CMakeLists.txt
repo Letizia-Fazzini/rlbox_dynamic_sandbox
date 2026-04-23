@@ -182,7 +182,7 @@ target_compile_definitions(dlmalloc_mspace PRIVATE
                            ONLY_MSPACES=1
                            USE_LOCKS=1
                            HAVE_MORECORE=0
-                           HAVE_MMAP=1)
+                           HAVE_MMAP=0)
 # dlmalloc triggers a fair number of benign warnings; quiet them so the
 # shim build stays readable.
 target_compile_options(dlmalloc_mspace PRIVATE

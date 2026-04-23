@@ -35,89 +35,104 @@ int main(int argc, char const *argv[]) {
   if(argc>1) {
     quality = std::stoi(argv[1]);
   }
+  int num_datasets = 1;
+  if(argc>2) {
+    num_datasets = std::stoi(argv[2]);
+  }
+  int iters = 10;
+  if(argc>3) {
+    iters = std::stoi(argv[3]);
+  }
 
   rlbox_sandbox_jpeg sandbox;
   sandbox.create_sandbox(JPEG_PROCESS_WRAPPER_PATH);
 
-  //put input stream inside sandbox as a flat packed pixel buffer
-  FILE* source = fopen("test_data.txt", "r");
-  int image_width, image_height, image_channels;
-  fscanf(source, "%d %d %d", &image_width, &image_height, &image_channels);
-  int row_stride = image_width * image_channels;
+  for(int d = 1; d <= num_datasets; d++) {
+    char filename[256];
+    snprintf(filename, sizeof(filename), "test_data/test_data%d.txt", d);
 
-  auto sandboxSrc = sandbox.malloc_in_sandbox<unsigned char>(image_height * row_stride);
+    for(int it = 0; it < iters; it++) {
+      //put input stream inside sandbox as a flat packed pixel buffer
+      FILE* source = fopen(filename, "r");
+      int image_width, image_height, image_channels;
+      fscanf(source, "%d %d %d", &image_width, &image_height, &image_channels);
+      int row_stride = image_width * image_channels;
 
-  for(int i = 0; i < image_height; i++) {
-    for (int j = 0; j < row_stride; j++) {
-      int val;
-      fscanf(source, "%d", &val);
-      sandboxSrc[i * row_stride + j] = (unsigned char)val;
+      auto sandboxSrc = sandbox.malloc_in_sandbox<unsigned char>(image_height * row_stride);
+
+      for(int i = 0; i < image_height; i++) {
+        for (int j = 0; j < row_stride; j++) {
+          int val;
+          fscanf(source, "%d", &val);
+          sandboxSrc[i * row_stride + j] = (unsigned char)val;
+        }
+      }
+      fclose(source);
+
+      //declare output file
+      FILE* destinationFile;
+      if ((destinationFile = fopen("compressed.jpeg", "wb")) == NULL) {
+        fprintf(stderr, "can't open output file\n");
+        exit(1);
+      }
+
+      //set up output buffer pointers inside sandbox
+      auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
+      *outBuffer = nullptr;
+      auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
+      *outSize = 0;
+
+      // TurboJPEG 3-call compression sequence
+      double t_start = monotonic_ms();
+      auto tjHandle = sandbox.invoke_sandbox_function(tjInitCompress);
+
+      auto compress_ret = sandbox.invoke_sandbox_function(
+        tjCompress2,
+        tjHandle,
+        sandboxSrc,
+        image_width,
+        row_stride,          // pitch: bytes per row (tightly packed)
+        image_height,
+        TJPF_RGB,
+        outBuffer,
+        outSize,
+        TJSAMP_444,          // no chroma subsampling, matches JCS_RGB intent
+        quality,
+        0
+      );
+      compress_ret.copy_and_verify([](int ret) {
+        release_assert(ret == 0, "tjCompress2 failed");
+        return ret;
+      });
+
+      sandbox.invoke_sandbox_function(tjDestroy, tjHandle);
+      printf("COMPRESSION_MS=%.3f\n", monotonic_ms() - t_start);
+
+      //free input buffer
+      sandbox.free_in_sandbox(sandboxSrc);
+
+      //copy data from sandbox buffer "outBuffer" to "compressed.jpeg"
+      auto verifiedSizePtr = outSize.copy_and_verify([](std::unique_ptr<unsigned long> size) {
+        release_assert(size != nullptr, "Output size ptr must not be null");
+        release_assert(*size > 0, "Output size must be greater than zero");
+        return size;
+      });
+      auto verifiedSize = (*verifiedSizePtr);
+
+      auto localBuffer = (*outBuffer).copy_and_verify_range([](std::unique_ptr<unsigned char[]> val) {
+        release_assert(val != nullptr, "Output buffer pointer must not be null");
+        return move(val);
+      }, verifiedSize);
+
+      fwrite(localBuffer.get(), 1, verifiedSize, destinationFile);
+      fclose(destinationFile);
+
+      // free the TurboJPEG-allocated output buffer inside the sandbox
+      sandbox.free_in_sandbox(*outBuffer);
+      sandbox.free_in_sandbox(outBuffer);
+      sandbox.free_in_sandbox(outSize);
     }
   }
-  fclose(source);
-
-  //declare output file
-  FILE* destinationFile;
-  if ((destinationFile = fopen("compressed.jpeg", "wb")) == NULL) {
-    fprintf(stderr, "can't open output file\n");
-    exit(1);
-  }
-
-  //set up output buffer pointers inside sandbox
-  auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
-  *outBuffer = nullptr;
-  auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
-  *outSize = 0;
-
-  // TurboJPEG 3-call compression sequence
-  double t_start = monotonic_ms();
-  auto tjHandle = sandbox.invoke_sandbox_function(tjInitCompress);
-
-  auto compress_ret = sandbox.invoke_sandbox_function(
-    tjCompress2,
-    tjHandle,
-    sandboxSrc,
-    image_width,
-    row_stride,          // pitch: bytes per row (tightly packed)
-    image_height,
-    TJPF_RGB,
-    outBuffer,
-    outSize,
-    TJSAMP_444,          // no chroma subsampling, matches JCS_RGB intent
-    quality,
-    0
-  );
-  compress_ret.copy_and_verify([](int ret) {
-    release_assert(ret == 0, "tjCompress2 failed");
-    return ret;
-  });
-
-  sandbox.invoke_sandbox_function(tjDestroy, tjHandle);
-  printf("COMPRESSION_MS=%.3f\n", monotonic_ms() - t_start);
-
-  //free input buffer
-  sandbox.free_in_sandbox(sandboxSrc);
-
-  //copy data from sandbox buffer "outBuffer" to "compressed.jpeg"
-  auto verifiedSizePtr = outSize.copy_and_verify([](std::unique_ptr<unsigned long> size) {
-    release_assert(size != nullptr, "Output size ptr must not be null");
-    release_assert(*size > 0, "Output size must be greater than zero");
-    return size;
-  });
-  auto verifiedSize = (*verifiedSizePtr);
-
-  auto localBuffer = (*outBuffer).copy_and_verify_range([](std::unique_ptr<unsigned char[]> val) {
-    release_assert(val != nullptr, "Output buffer pointer must not be null");
-    return move(val);
-  }, verifiedSize);
-
-  fwrite(localBuffer.get(), 1, verifiedSize, destinationFile);
-  fclose(destinationFile);
-
-  // free the TurboJPEG-allocated output buffer inside the sandbox
-  sandbox.free_in_sandbox(*outBuffer);
-  sandbox.free_in_sandbox(outBuffer);
-  sandbox.free_in_sandbox(outSize);
 
   // destroy sandbox
   sandbox.destroy_sandbox();

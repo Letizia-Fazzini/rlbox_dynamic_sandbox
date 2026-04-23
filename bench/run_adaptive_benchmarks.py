@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Drive the benchmark across three backends for a chosen library:
-    - native:  bench_native (stock libz or libjpeg)
-    - wasm2c:  test/<lib>-testing/build/main (RLBox wasm2c sandbox)
-    - process: test/<lib>-testing/build/main_process (this repo's process sandbox)
+Drive the benchmark across backends for a chosen library:
+    - native:   bench_native (stock libz or libjpeg)
+    - wasm2c:   test/<lib>-testing/build/main (RLBox wasm2c sandbox)
+    - process:  test/<lib>-testing/build/main_process (capnp)
+    - adaptive: test/<lib>-testing/build/main_adaptive
 
 Select the library with --library {zlib,jpeg} (default: jpeg).
 
@@ -11,19 +12,16 @@ For zlib: compression levels are 1-9 (higher = more compression).
 For jpeg: quality levels are 1-100 (higher = LESS compression / better quality).
   Recommended quality values: 90, 50, 25, 10.
 
-Each binary may print a line like
+Each binary may print lines like
     COMPRESSION_MS=12.345
-which is parsed as the in-binary timing; we also record Python wall-clock time.
+(one per dataset x inner iteration) which are parsed as in-binary timings;
+we also record Python wall-clock time.
 
-The sandbox mains hard-code 'test_data/test_data1.txt' as the input file and
-'./sandbox_shim.so' as the shim preload path. So we run each binary from the
-build directory and stage inputs by overwriting test_data/test_data1.txt there,
-restoring the original at the end.
-
-Both test_data.txt files have a header line that must appear exactly once; only
-the body is repeated to reach the target size.  For libjpeg the header encodes
-image dimensions (W H C) and is rewritten to reflect the actual number of rows
-included, so the C binaries always read a consistent file.
+All binaries accept: binary quality [num_datasets] [inner_iters]
+and read from test_data/test_data{d}.txt (relative to cwd).
+This script creates that directory in each build dir, writes one file per size,
+then invokes each binary once per (backend, level), covering all datasets in a
+single call.  The test_data/ directory is backed up and restored afterwards.
 """
 from __future__ import annotations
 
@@ -92,8 +90,8 @@ def ensure_bench_native(build_dir: Path) -> Path:
     return binary
 
 
-def prepare_input(build_dir: Path, source_bytes: bytes, size: int, library: Library = Library.ZLIB) -> None:
-    """Write a resized test_data.txt to build_dir.
+def _write_input(target: Path, source_bytes: bytes, size: int, library: Library = Library.ZLIB) -> None:
+    """Write a resized input file to `target`.
 
     The first line of source_bytes (the header) is written exactly once.  Only
     the body is repeated to reach approximately `size` bytes.
@@ -103,8 +101,6 @@ def prepare_input(build_dir: Path, source_bytes: bytes, size: int, library: Libr
     line is rewritten with the actual number of rows included, so that the C
     binaries (which fscanf the header) always read a consistent file.
     """
-    target = build_dir / "test_data" / "test_data1.txt"
-    target.parent.mkdir(parents=True, exist_ok=True)
     if not source_bytes:
         raise RuntimeError("empty source bytes — can't repeat to target size")
 
@@ -150,6 +146,14 @@ def prepare_input(build_dir: Path, source_bytes: bytes, size: int, library: Libr
         target.write_bytes(blob)
 
 
+def prepare_inputs_dir(build_dir: Path, source_bytes: bytes, sizes: list[int], library: Library = Library.ZLIB) -> None:
+    """Create build_dir/test_data/ and write test_data{d}.txt for each size (1-indexed)."""
+    data_dir = build_dir / "test_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for d, size in enumerate(sizes, start=1):
+        _write_input(data_dir / f"test_data{d}.txt", source_bytes, size, library=library)
+
+
 def run_once(cmd: list[str], cwd: Path) -> tuple[float, str]:
     """Run cmd under cwd, return (wall_ms, stdout_text)."""
     print(f"[bench]   -> running: {' '.join(cmd)}", file=sys.stderr)
@@ -167,23 +171,34 @@ def run_once(cmd: list[str], cwd: Path) -> tuple[float, str]:
     return wall_ms, res.stdout
 
 
-def parse_timing(stdout: str) -> Optional[float]:
-    m = COMPRESSION_RE.search(stdout)
-    return float(m.group(1)) if m else None
+def parse_timings(stdout: str) -> list[float]:
+    """Return all COMPRESSION_MS= values found in stdout, in order."""
+    return [float(v) for v in COMPRESSION_RE.findall(stdout)]
 
 
-def run_config(
+def run_config_multi(
     backend: str,
     cmd: list[str],
     cwd: Path,
-    size: int,
+    sizes: list[int],
     level: int,
+    inner_iters: int,
     iters: int,
     warmup: bool,
 ) -> list[dict]:
-    """Run `cmd` `iters` times and return a list of records."""
-    print(f"[bench] backend={backend} size={size} level={level} warmup={warmup} iters={iters}",
-          file=sys.stderr)
+    """Run `cmd` `iters` times (outer loop) and return a list of records.
+
+    The binary iterates over len(sizes) datasets, each for inner_iters inner
+    iterations, printing one COMPRESSION_MS= line per (dataset, inner_iter)
+    pair.  Each outer run produces len(sizes) * inner_iters timing values which
+    are mapped back to their respective size and inner_iter index.
+    """
+    expected_timings = len(sizes) * inner_iters
+    print(
+        f"[bench] backend={backend} sizes={sizes} level={level} "
+        f"inner_iters={inner_iters} iters={iters} warmup={warmup}",
+        file=sys.stderr,
+    )
     if warmup:
         print(f"[bench]  [warmup]", file=sys.stderr)
         t0 = time.monotonic()
@@ -192,48 +207,36 @@ def run_config(
     rows = []
     for i in range(iters):
         print(f"[bench]  iter {i+1}/{iters}", file=sys.stderr)
-        t0 = time.monotonic()
         wall_ms, stdout = run_once(cmd, cwd)
-        elapsed = (time.monotonic() - t0) * 1000.0
-        compression_ms = parse_timing(stdout)
-        print(f"[bench]  iter {i+1} done: wall_ms={wall_ms:.1f}, compression_ms={compression_ms}",
-              file=sys.stderr)
-        rows.append(
-            dict(
-                backend=backend,
-                size_bytes=size,
-                level=level,
-                iter=i,
-                wall_ms=wall_ms,
-                compression_ms=compression_ms,
+        timings = parse_timings(stdout)
+        if len(timings) != expected_timings:
+            print(
+                f"[bench]  WARNING: expected {expected_timings} COMPRESSION_MS lines, "
+                f"got {len(timings)}",
+                file=sys.stderr,
             )
+        for d_idx, size in enumerate(sizes):
+            for it in range(inner_iters):
+                timing_idx = d_idx * inner_iters + it
+                compression_ms = timings[timing_idx] if timing_idx < len(timings) else None
+                rows.append(
+                    dict(
+                        backend=backend,
+                        size_bytes=size,
+                        level=level,
+                        iter=i,
+                        inner_iter=it,
+                        wall_ms=wall_ms / expected_timings if expected_timings else wall_ms,
+                        compression_ms=compression_ms,
+                    )
+                )
+        preview = timings[:4]
+        suffix = "..." if len(timings) > 4 else ""
+        print(
+            f"[bench]  iter {i+1} done: wall_ms={wall_ms:.1f}, timings={preview}{suffix}",
+            file=sys.stderr,
         )
     return rows
-
-
-def parse_process_builds(s: Optional[str], testing_dir: Path) -> list[tuple[str, Path]]:
-    """Parse a comma-separated list of label:path entries.  An entry without
-    a colon is treated as `process_<label>:<testing_dir>/<label>`.
-    When `s` is None the default rpclib + capnp variants are returned,
-    resolved under `testing_dir`.
-    """
-    default_subdirs = [
-        ("process_rpclib", "build_rpclib"),
-        ("process_capnp", "build_capnp"),
-    ]
-    if not s:
-        return [(label, testing_dir / subdir) for (label, subdir) in default_subdirs]
-    out: list[tuple[str, Path]] = []
-    for chunk in s.split(","):
-        c = chunk.strip()
-        if not c:
-            continue
-        if ":" in c:
-            label, path = c.split(":", 1)
-            out.append((label.strip(), Path(path.strip()).resolve()))
-        else:
-            out.append((f"process_{c}", (testing_dir / c).resolve()))
-    return out
 
 
 def main() -> int:
@@ -245,25 +248,32 @@ def main() -> int:
              "for jpeg, levels are quality values 1-100 (higher = LESS compression).",
     )
     ap.add_argument("--wasm2c-build-dir", type=Path, default=None,
-                    help="build dir holding the wasm2c `main` binary "
+                    help="build dir holding the wasm2c `main` binary and bench_native "
                          "(default: test/<library>-testing/build)")
-    ap.add_argument("--process-builds", type=str, default=None,
-                    help="comma-separated process variants to drive, "
-                         "either `label:path` or `subdir` (resolved under "
-                         "test/<library>-testing/).  Default: rpclib + capnp.")
     ap.add_argument("--sizes", type=str, default="500k, 1m, 4m",
-                    help="input sizes, comma-separated; k/m suffixes ok")
+                    help="input sizes, comma-separated; k/m suffixes ok.  Each size "
+                         "becomes one numbered dataset (test_data/test_data{N}.txt) "
+                         "and all datasets are processed in a single binary invocation.")
     ap.add_argument("--levels", type=str, default=None,
                     help="compression levels (zlib: 1-9, higher = more compression) or "
                          "quality values (jpeg: 1-100, higher = LESS compression). "
                          "Comma-separated. Defaults: zlib -> 1,6,9; jpeg -> 90,50,25,10.")
     ap.add_argument("--iters", type=int, default=3,
-                    help="iterations per (backend, size, level)")
+                    help="outer iterations per (backend, level): number of times the "
+                         "entire binary is re-invoked (statistical repetitions)")
+    ap.add_argument("--num-datasets", type=int, default=None,
+                    help="number of datasets passed to each binary as the second "
+                         "positional arg (default: len(sizes)).  Must not exceed len(sizes).")
+    ap.add_argument("--inner-iters", type=int, default=1,
+                    help="inner iterations per dataset inside the binary, passed as "
+                         "the third positional arg (default: 1)")
     ap.add_argument("--out", type=Path, default=BENCH_DIR / "results.csv")
     ap.add_argument("--no-wasm2c", action="store_true",
                     help="skip the wasm2c backend (e.g. if not built)")
     ap.add_argument("--no-process", action="store_true",
                     help="skip the process backends entirely")
+    ap.add_argument("--no-adaptive", action="store_true",
+                    help="skip the adaptive backend (build/main_adaptive)")
     args = ap.parse_args()
 
     # --- Per-library config ---------------------------------------------------
@@ -277,23 +287,22 @@ def main() -> int:
         else testing_dir / "build"
     )
     sizes = parse_sizes(args.sizes)
+    num_datasets = min(args.num_datasets, len(sizes)) if args.num_datasets is not None else len(sizes)
+    inner_iters = args.inner_iters
     levels = parse_ints(args.levels if args.levels is not None else default_levels)
     source_data = testing_dir / "test_data.txt"
     # -------------------------------------------------------------------------
 
+    # --- Validate backends ---------------------------------------------------
     main_bin = wasm2c_build_dir / "main"
     if not args.no_wasm2c and not main_bin.exists():
         print(f"[bench] {main_bin} missing; pass --no-wasm2c or rebuild",
               file=sys.stderr)
         return 1
-    # Native + wasm2c read test_data.txt from the wasm2c build dir; we still need
-    # *some* seed file even when wasm2c is skipped, so fall back to whichever
-    # process build we'll use.
-    seed_dir = wasm2c_build_dir if not args.no_wasm2c else None
 
     process_builds: list[tuple[str, Path]] = []
     if not args.no_process:
-        process_builds = parse_process_builds(args.process_builds, testing_dir)
+        process_builds = [("process_capnp", testing_dir / "build")]
         for label, build_dir in process_builds:
             if not (build_dir / "main_process").exists():
                 print(f"[bench] {build_dir}/main_process missing; configure "
@@ -304,98 +313,132 @@ def main() -> int:
                 print(f"[bench] {build_dir}/sandbox_shim.so missing",
                       file=sys.stderr)
                 return 1
-        if seed_dir is None:
-            seed_dir = process_builds[0][1]
-    if seed_dir is None:
-        print("[bench] nothing to do — all backends disabled", file=sys.stderr)
-        return 1
+
+    adaptive_build_dir: Optional[Path] = None
+    if not args.no_adaptive:
+        adaptive_build_dir = testing_dir / "build"
+        if not (adaptive_build_dir / "main_adaptive").exists():
+            print(f"[bench] {adaptive_build_dir}/main_adaptive missing; "
+                  f"pass --no-adaptive or rebuild",
+                  file=sys.stderr)
+            return 1
+        if not (adaptive_build_dir / "sandbox_shim.so").exists():
+            print(f"[bench] {adaptive_build_dir}/sandbox_shim.so missing",
+                  file=sys.stderr)
+            return 1
 
     bench_native = ensure_bench_native(wasm2c_build_dir)
+    # -------------------------------------------------------------------------
 
-    # Save the original test_data.txt for each build dir we'll be writing to so we
-    # can restore them all after benchmarking.
-    write_dirs = []
-    if not args.no_wasm2c:
-        write_dirs.append(wasm2c_build_dir)
+    # wasm2c_build_dir is always included so bench_native has a test_data/ dir.
+    # Deduplicate while preserving order.
+    write_dirs: list[Path] = [wasm2c_build_dir]
     write_dirs.extend(d for _, d in process_builds)
+    if adaptive_build_dir is not None:
+        write_dirs.append(adaptive_build_dir)
+    seen: set[Path] = set()
+    write_dirs = [d for d in write_dirs if not (d in seen or seen.add(d))]  # type: ignore[func-returns-value]
+
     seed_bytes = source_data.read_bytes()
+
+    # Backup test_data/ directories so we can restore them afterwards.
     backups: list[tuple[Path, Optional[Path]]] = []
     for d in write_dirs:
-        test_data = d / "test_data" / "test_data1.txt"
-        if test_data.exists():
-            backup = test_data.with_suffix(".txt.bench_backup")
-            shutil.copyfile(test_data, backup)
-            backups.append((test_data, backup))
+        data_dir = d / "test_data"
+        if data_dir.exists():
+            backup = d / "test_data_bench_backup"
+            shutil.copytree(str(data_dir), str(backup))
+            backups.append((data_dir, backup))
         else:
-            backups.append((test_data, None))
-    print(f"[bench] staged test_data/test_data1.txt in {len(write_dirs)} build dir(s)",
+            backups.append((data_dir, None))
+    print(f"[bench] will write test_data/ in {len(write_dirs)} build dir(s)",
           file=sys.stderr)
+
+    # Sizes used in this run (may be fewer than len(sizes) if --num-datasets set).
+    active_sizes = sizes[:num_datasets]
+    # Positional args appended to every binary invocation after the quality/level.
+    cmd_suffix = [str(num_datasets), str(inner_iters)]
 
     all_rows: list[dict] = []
     try:
-        for size in sizes:
-            print(f"[bench] preparing input for size={size}", file=sys.stderr)
-            t0 = time.monotonic()
-            for d in write_dirs:
-                prepare_input(d, seed_bytes, size, library=library)
-            print(f"[bench] input preparation done in {(time.monotonic()-t0)*1000:.1f} ms",
-                  file=sys.stderr)
-            for level in levels:
-                print(f"[bench] size={size} level={level}", file=sys.stderr)
+        print(f"[bench] preparing {num_datasets} dataset(s) in each build dir", file=sys.stderr)
+        t0 = time.monotonic()
+        for d in write_dirs:
+            prepare_inputs_dir(d, seed_bytes, active_sizes, library=library)
+        print(f"[bench] input preparation done in {(time.monotonic()-t0)*1000:.1f} ms",
+              file=sys.stderr)
 
-                for label, build_dir in process_builds:
-                    rows = run_config(
-                        label,
-                        [str(build_dir / "main_process"), str(level), "1", "1"],
-                        cwd=build_dir,
-                        size=size,
-                        level=level,
-                        iters=args.iters,
-                        warmup=True,
-                    )
-                    all_rows.extend(rows)
+        for level in levels:
+            print(f"[bench] level={level}", file=sys.stderr)
 
-                # Native reference — runs from whichever dir we picked for
-                # seeding (test_data.txt is identical across them).
-                rows = run_config(
-                    "native",
-                    [str(bench_native), str(level), "1", "1"],
-                    cwd=write_dirs[0],
-                    size=size,
+            for label, build_dir in process_builds:
+                rows = run_config_multi(
+                    label,
+                    [str(build_dir / "main_process"), str(level)] + cmd_suffix,
+                    cwd=build_dir,
+                    sizes=active_sizes,
                     level=level,
+                    inner_iters=inner_iters,
                     iters=args.iters,
                     warmup=True,
                 )
                 all_rows.extend(rows)
 
-                if not args.no_wasm2c:
-                    rows = run_config(
-                        "wasm2c",
-                        [str(main_bin), str(level), "1", "1"],
-                        cwd=wasm2c_build_dir,
-                        size=size,
-                        level=level,
-                        iters=args.iters,
-                        warmup=True,
-                    )
-                    all_rows.extend(rows)
+            if adaptive_build_dir is not None:
+                rows = run_config_multi(
+                    "adaptive",
+                    [str(adaptive_build_dir / "main_adaptive"), str(level)] + cmd_suffix,
+                    cwd=adaptive_build_dir,
+                    sizes=active_sizes,
+                    level=level,
+                    inner_iters=inner_iters,
+                    iters=args.iters,
+                    warmup=True,
+                )
+                all_rows.extend(rows)
+
+            # Native reference always runs from wasm2c_build_dir.
+            rows = run_config_multi(
+                "native",
+                [str(bench_native), str(level)] + cmd_suffix,
+                cwd=wasm2c_build_dir,
+                sizes=active_sizes,
+                level=level,
+                inner_iters=inner_iters,
+                iters=args.iters,
+                warmup=True,
+            )
+            all_rows.extend(rows)
+
+            if not args.no_wasm2c:
+                rows = run_config_multi(
+                    "wasm2c",
+                    [str(main_bin), str(level)] + cmd_suffix,
+                    cwd=wasm2c_build_dir,
+                    sizes=active_sizes,
+                    level=level,
+                    inner_iters=inner_iters,
+                    iters=args.iters,
+                    warmup=True,
+                )
+                all_rows.extend(rows)
     finally:
-        for test_data, backup in backups:
+        for data_dir, backup in backups:
+            shutil.rmtree(str(data_dir), ignore_errors=True)
             if backup is not None:
-                shutil.move(str(backup), str(test_data))
-            else:
-                test_data.unlink(missing_ok=True)
-        print("[bench] restored test_data.txt files", file=sys.stderr)
+                shutil.move(str(backup), str(data_dir))
+        print("[bench] restored test_data/ directories", file=sys.stderr)
 
     # Write CSV.
-    fields = ["backend", "size_bytes", "level", "iter", "wall_ms", "compression_ms"]
+    fields = ["backend", "size_bytes", "level", "iter", "inner_iter", "wall_ms", "compression_ms"]
     with open(args.out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
         w.writerows(all_rows)
     print(f"[bench] wrote {len(all_rows)} rows -> {args.out}", file=sys.stderr)
 
-    # Short summary: median elapsed time per (backend, size, level).
+    # Short summary: median compression_ms (or wall_ms) per (backend, size, level),
+    # aggregated over all inner_iter and iter values.
     # compression_ms may be None when the binary doesn't print COMPRESSION_MS=;
     # fall back to wall_ms in that case.
     def key(r):
