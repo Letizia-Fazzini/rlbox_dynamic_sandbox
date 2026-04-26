@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Drive the benchmark across backends for a chosen library:
-    - native:   bench_native (stock libz or libjpeg)
+    - native:   test/<lib>-testing/build/bench_native (no sandboxing at all)
     - wasm2c:   test/<lib>-testing/build/main (RLBox wasm2c sandbox)
-    - process:  test/<lib>-testing/build/main_process (capnp)
+    - process:  test/<lib>-testing/build/main_process (rpclib or capnp depending on build flags used)
     - adaptive: test/<lib>-testing/build/main_adaptive
 
 Select the library with --library {zlib,jpeg} (default: jpeg).
@@ -250,7 +250,7 @@ def main() -> int:
     ap.add_argument("--wasm2c-build-dir", type=Path, default=None,
                     help="build dir holding the wasm2c `main` binary and bench_native "
                          "(default: test/<library>-testing/build)")
-    ap.add_argument("--sizes", type=str, default="500k, 1m, 4m",
+    ap.add_argument("--sizes", type=str, default="100k, 250k, 500k",
                     help="input sizes, comma-separated; k/m suffixes ok.  Each size "
                          "becomes one numbered dataset (test_data/test_data{N}.txt) "
                          "and all datasets are processed in a single binary invocation.")
@@ -300,19 +300,18 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    process_builds: list[tuple[str, Path]] = []
+    process_build_dir: Optional[Path] = None
     if not args.no_process:
-        process_builds = [("process_capnp", testing_dir / "build")]
-        for label, build_dir in process_builds:
-            if not (build_dir / "main_process").exists():
-                print(f"[bench] {build_dir}/main_process missing; configure "
-                      f"with -DRLBOX_TRANSPORT=... and rebuild",
-                      file=sys.stderr)
-                return 1
-            if not (build_dir / "sandbox_shim.so").exists():
-                print(f"[bench] {build_dir}/sandbox_shim.so missing",
-                      file=sys.stderr)
-                return 1
+        process_build_dir = testing_dir / "build"
+        if not (process_build_dir / "main_process").exists():
+            print(f"[bench] {process_build_dir}/main_process missing; configure "
+                  f"with -DRLBOX_TRANSPORT=... and rebuild",
+                  file=sys.stderr)
+            return 1
+        if not (process_build_dir / "sandbox_shim.so").exists():
+            print(f"[bench] {process_build_dir}/sandbox_shim.so missing",
+                  file=sys.stderr)
+            return 1
 
     adaptive_build_dir: Optional[Path] = None
     if not args.no_adaptive:
@@ -333,7 +332,8 @@ def main() -> int:
     # wasm2c_build_dir is always included so bench_native has a test_data/ dir.
     # Deduplicate while preserving order.
     write_dirs: list[Path] = [wasm2c_build_dir]
-    write_dirs.extend(d for _, d in process_builds)
+    if process_build_dir is not None:
+        write_dirs.append(process_build_dir)
     if adaptive_build_dir is not None:
         write_dirs.append(adaptive_build_dir)
     seen: set[Path] = set()
@@ -371,11 +371,11 @@ def main() -> int:
         for level in levels:
             print(f"[bench] level={level}", file=sys.stderr)
 
-            for label, build_dir in process_builds:
+            if process_build_dir is not None:
                 rows = run_config_multi(
-                    label,
-                    [str(build_dir / "main_process"), str(level)] + cmd_suffix,
-                    cwd=build_dir,
+                    "process",
+                    [str(process_build_dir / "main_process"), str(level)] + cmd_suffix,
+                    cwd=process_build_dir,
                     sizes=active_sizes,
                     level=level,
                     inner_iters=inner_iters,

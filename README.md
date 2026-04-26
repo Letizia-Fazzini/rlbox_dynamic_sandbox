@@ -38,27 +38,3 @@ Dev build (warnings-as-errors, address sanitizer, clang-tidy if installed):
 cmake -DCMAKE_BUILD_TYPE=Debug -DDEV=ON -S . -B ./build
 ```
 
-## zlib end-to-end test
-
-Uses `add_subdirectory` to pull this repo in and builds two variants side-by-side: `main` (wasm2c) and `main_process` (process backend).
-
-```bash
-cd test/zlib-testing
-cmake -S . -B ./build
-cmake --build ./build --parallel
-cd build
-./main_process 6     # process backend, compression level 6
-./main 6             # wasm2c backend (requires wasi-sdk; auto-fetched)
-```
-
-Both compress `pi.txt` and verify byte-identical output against stock libz.
-
-## Benchmarks
-
-```bash
-cd bench
-python3 run_benchmarks.py      # writes results.csv
-python3 plot_results.py        # writes plots/*.png
-```
-
-Driver flags: `--sizes`, `--levels`, `--iters`, `--no-wasm2c`, `--no-process`. See `bench/README.md` for details.
