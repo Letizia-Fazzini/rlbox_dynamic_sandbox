@@ -10,7 +10,7 @@ RGB image) at a given quality setting and prints
 We parse that, plus the Python wall-clock wrapper, and record everything to
 a CSV.
 
-Unlike zlib, input size isn't varied — rgb_grid.txt is the sole input and
+Unlike zlib, input size isn't varied -- rgb_grid.txt is the sole input and
 is committed to the repo. Only quality (1..100) is swept.
 """
 from __future__ import annotations

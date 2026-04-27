@@ -34,7 +34,6 @@ int main(int argc, char const *argv[]) {
     snprintf(filename, sizeof(filename), "test_data/test_data%d.txt", d);
 
     for(int it = 0; it < iters; it++) {
-      // read image
       FILE* source = fopen(filename, "r");
       if (!source) {
         fprintf(stderr, "can't open %s\n", filename);

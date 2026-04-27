@@ -14,15 +14,10 @@ static double monotonic_ms()
 
 #define release_assert(cond, msg) if (!(cond)) { fputs(msg "\n", stderr); abort(); }
 
-// We're going to use RLBox in a single-threaded environment.
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
-// The fixed configuration line we need to use for the wasm2c sandbox.
-// It specifies that all calls into the sandbox are resolved statically.
 #define RLBOX_USE_STATIC_CALLS() rlbox_wasm2c_sandbox_lookup_symbol
-// The rlbox wasm2c plugin requires that you provide the wasm2c module's name
 #define RLBOX_WASM2C_MODULE_NAME jpeg
 
-// Include the produced header from wasm2c
 #include "jpeg.wasm.h"
 #include "rlbox.hpp"
 #include "rlbox_wasm2c_sandbox.hpp"
@@ -30,12 +25,10 @@ static double monotonic_ms()
 
 using namespace rlbox;
 
-// Define base type for libjpeg-turbo using the wasm2c sandbox
 RLBOX_DEFINE_BASE_TYPES_FOR(jpeg, wasm2c);
 
 int main(int argc, char const *argv[]) {
 
-  //read in quality from stdin
   int quality = 50;
   if(argc>1) {
     quality = std::stoi(argv[1]);
@@ -49,7 +42,6 @@ int main(int argc, char const *argv[]) {
     iters = std::stoi(argv[3]);
   }
 
-  // Declare and create a new sandbox
   rlbox_sandbox_jpeg sandbox;
   sandbox.create_sandbox();
 
@@ -58,7 +50,6 @@ int main(int argc, char const *argv[]) {
     snprintf(filename, sizeof(filename), "test_data/test_data%d.txt", d);
 
     for(int it = 0; it < iters; it++) {
-      //put input stream inside sandbox as a flat packed pixel buffer
       FILE* source = fopen(filename, "r");
       int image_width, image_height, image_channels;
       fscanf(source, "%d %d %d", &image_width, &image_height, &image_channels);
@@ -72,14 +63,12 @@ int main(int argc, char const *argv[]) {
       }
       fclose(source);
 
-      //declare output file
       FILE* destinationFile;
       if ((destinationFile = fopen("compressed.jpeg", "wb")) == NULL) {
         fprintf(stderr, "can't open output file\n");
         exit(1);
       }
 
-      //set up output buffer pointers inside sandbox
       auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
       *outBuffer = nullptr;
       auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
@@ -112,7 +101,6 @@ int main(int argc, char const *argv[]) {
 
       sandbox.free_in_sandbox(sandboxSrc);
 
-      //copy data from sandbox buffer "outBuffer" to "compressed.jpeg"
       auto verifiedSizePtr = outSize.copy_and_verify([](std::unique_ptr<unsigned long> size) {
         release_assert(size != nullptr, "Output size ptr must not be null");
         release_assert(*size > 0, "Output size must be greater than zero");
@@ -134,7 +122,6 @@ int main(int argc, char const *argv[]) {
     }
   }
 
-  // destroy sandbox
   sandbox.destroy_sandbox();
 
   return 0;

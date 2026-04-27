@@ -14,16 +14,11 @@ static double monotonic_ms()
 
 #define release_assert(cond, msg) if (!(cond)) { fputs(msg "\n", stderr); abort(); }
 
-// We're going to use RLBox in a single-threaded environment.
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
-// The meta-sandbox resolves symbols dynamically per-backend at dispatch time;
-// do NOT define RLBOX_USE_STATIC_CALLS() here (see rlbox_meta_sandbox.hpp).
-// The wasm2c module name and generated header must be set up before the meta
-// include so the meta header (which re-includes rlbox_wasm2c_sandbox.hpp
-// internally) can see them.
+// Meta resolves symbols dynamically per backend at dispatch time. Do NOT
+// define RLBOX_USE_STATIC_CALLS().
 #define RLBOX_WASM2C_MODULE_NAME jpeg
 
-// Include the produced header from wasm2c
 #include "jpeg.wasm.h"
 #include "rlbox.hpp"
 #include "rlbox_meta_sandbox.hpp"
@@ -31,12 +26,10 @@ static double monotonic_ms()
 
 using namespace rlbox;
 
-// Define base types for libjpeg-turbo using the meta (adaptive) sandbox
 RLBOX_DEFINE_BASE_TYPES_FOR(jpeg, meta);
 
 int main(int argc, char const *argv[]) {
 
-  //read in quality from stdin
   int quality = 50;
   if(argc>1) {
     quality = std::stoi(argv[1]);
@@ -50,11 +43,8 @@ int main(int argc, char const *argv[]) {
     iters = std::stoi(argv[3]);
   }
 
-  // Declare and create a new sandbox (both process and wasm backends)
   rlbox_sandbox_jpeg sandbox;
   sandbox.create_sandbox(JPEG_PROCESS_WRAPPER_PATH);
-  // Install the adaptive dispatch policy: explore each backend 3 times per
-  // symbol, then route to whichever has the lower median latency.
   sandbox.get_sandbox_impl()->set_policy(rlbox::make_adaptive_policy());
 
   for(int d = 1; d <= num_datasets; d++) {
@@ -63,7 +53,6 @@ int main(int argc, char const *argv[]) {
 
     for(int it = 0; it < iters; it++) {
       fprintf(stderr, "[DBG] d=%d it=%d step=1: opening %s\n", d, it, filename); fflush(stderr);
-      //put input stream inside sandbox as a flat packed pixel buffer
       FILE* source = fopen(filename, "r");
       int image_width, image_height, image_channels;
       fscanf(source, "%d %d %d", &image_width, &image_height, &image_channels);
@@ -80,14 +69,12 @@ int main(int argc, char const *argv[]) {
       fclose(source);
       fprintf(stderr, "[DBG] d=%d it=%d step=4: pixel data loaded\n", d, it); fflush(stderr);
 
-      //declare output file
       FILE* destinationFile;
       if ((destinationFile = fopen("compressed.jpeg", "wb")) == NULL) {
         fprintf(stderr, "can't open output file\n");
         exit(1);
       }
 
-      //set up output buffer pointers inside sandbox
       auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
       *outBuffer = nullptr;
       auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
@@ -128,7 +115,6 @@ int main(int argc, char const *argv[]) {
       sandbox.free_in_sandbox(sandboxSrc);
       fprintf(stderr, "[DBG] d=%d it=%d step=12: sandboxSrc freed\n", d, it); fflush(stderr);
 
-      //copy data from sandbox buffer "outBuffer" to "compressed.jpeg"
       fprintf(stderr, "[DBG] d=%d it=%d step=13: copy_and_verify outSize\n", d, it); fflush(stderr);
       auto verifiedSizePtr = outSize.copy_and_verify([](std::unique_ptr<unsigned long> size) {
         release_assert(size != nullptr, "Output size ptr must not be null");
@@ -158,7 +144,6 @@ int main(int argc, char const *argv[]) {
     }
   }
 
-  // destroy sandbox
   sandbox.destroy_sandbox();
 
   return 0;

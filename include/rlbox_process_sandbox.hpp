@@ -53,10 +53,9 @@ namespace rlbox {
 class rlbox_process_sandbox
 {
 public:
-  // The child is a native Linux x86_64 process sharing the host ABI, so
-  // the integer widths mirror the host.  T_PointerType stays as an
-  // unsigned integer because rlbox's tainted<T*> is serialized as a
-  // sandbox offset on the wire (offset = host_addr - shared_memory_base).
+  // Child is native Linux x86_64 sharing the host ABI; integer widths
+  // mirror the host. T_PointerType is unsigned because rlbox serializes
+  // tainted<T*> as a sandbox offset on the wire.
   using T_LongLongType = int64_t;
   using T_LongType = int64_t;
   using T_IntType = int32_t;
@@ -76,11 +75,8 @@ protected:
   std::unique_ptr<std::thread> callback_thread;
   std::mutex client_mutex;
 #elif defined(RLBOX_TRANSPORT_CAPNP)
-  // Two SOCK_STREAM Unix socket pairs created before fork: one for the
-  // request channel (host -> shim) and one for callbacks (shim -> host).
-  // The host keeps the [0] ends; the [1] ends inherit across exec into
-  // the shim, which finds them via env vars.  No port discovery / no
-  // listen-wait dance required.
+  // SOCK_STREAM Unix socket pairs created pre-fork: request (host->shim)
+  // and callback (shim->host). Shim picks up the inherited fds via env.
   int request_fd = -1;
   int callback_fd = -1;
   std::mutex request_mutex;
@@ -89,13 +85,9 @@ protected:
 #endif
 
 #if defined(RLBOX_TRANSPORT_RPCLIB)
-  // Block until a loopback TCP port is accepting connections, or the
-  // deadline elapses.  Returns true if a connect() succeeded.
-  //
-  // rpc::client construction is non-blocking — it returns before the
-  // server is reachable, so the first real RPC call can fail if the
-  // child's RPC thread hasn't yet bound its listen socket.  Probing with a
-  // plain connect() here gives us a crisp "ready" signal.
+  // Block until the loopback TCP port accepts connections or the
+  // deadline elapses. rpc::client construction is non-blocking, so this
+  // gives a crisp "ready" signal before the first real RPC.
   static bool wait_for_tcp_listener(uint16_t port, int timeout_ms)
   {
     auto deadline = std::chrono::steady_clock::now() +
@@ -120,10 +112,8 @@ protected:
     return false;
   }
 
-  // Ask the kernel for an unused loopback TCP port by binding to port 0 and
-  // reading it back via getsockname.  Returns 0 on failure.  A small TOCTOU
-  // window exists between this probe and the eventual rebind, but in
-  // practice it's plenty for our use and lets multiple sandboxes coexist.
+  // Find an unused loopback TCP port by binding to 0 and reading it back.
+  // Small TOCTOU between probe and rebind; fine in practice.
   static uint16_t find_free_tcp_port()
   {
     int sock = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -152,22 +142,15 @@ protected:
   static inline std::map<uintptr_t, rlbox_process_sandbox*> global_registry;
   static inline std::mutex registry_mutex;
 
-  // Callback dispatchers keyed by host-side unique key.  Each dispatcher
-  // takes the int64-widened argument slots coming off the wire and returns
-  // the callback's result (also widened to int64; 0 for void returns).
+  // Callback dispatchers keyed by host-side unique key. Args are int64
+  // wire slots; result is int64 (0 for void).
   std::map<uintptr_t, std::function<int64_t(const std::vector<int64_t>&)>>
     callback_map;
   std::mutex callback_mutex;
 
-  // ----- Transport-specific helpers ------------------------------------
-  //
-  // These thin wrappers hide the on-the-wire mechanics so the rest of the
-  // class is identical between transports.
-
 #if defined(RLBOX_TRANSPORT_CAPNP)
-  // Synchronous request/response over the request socket.  Mutex-serialized
-  // because the kernel doesn't preserve message boundaries for concurrent
-  // writers on a SOCK_STREAM, and we read directly afterward.
+  // Synchronous request/response over the request socket. Mutex-serialized
+  // because SOCK_STREAM doesn't preserve message boundaries.
   int64_t capnp_call(std::function<void(wire::Request::Builder&)> build)
   {
     std::lock_guard<std::mutex> lock(request_mutex);
@@ -210,12 +193,9 @@ protected:
             }
           }
           if (dispatcher) {
-            // Publish (this, key) so the user-registered interceptor —
-            // which runs inside dispatcher() — can recover its context
-            // through impl_get_executed_callback_sandbox_and_key().
-            // Callback dispatch runs on a dedicated host-side thread
-            // (this loop), distinct from the invoker's thread, so the
-            // meta-sandbox's own TLS approach wouldn't reach here.
+            // Publish (this, key) so the interceptor inside dispatcher()
+            // can recover its context via
+            // impl_get_executed_callback_sandbox_and_key.
             detail::thread_local_sandbox = this;
             detail::thread_local_callback_key = reinterpret_cast<void*>(key);
             result = dispatcher(args);
@@ -226,8 +206,7 @@ protected:
           out_msg.initRoot<wire::CallbackResponse>().setResult(result);
           capnp::writeMessageToFd(callback_fd, out_msg);
         } catch (const kj::Exception&) {
-          // EOF / shim teardown — exit the loop cleanly.
-          return;
+          return;  // EOF / shim teardown.
         }
       }
     });
@@ -235,11 +214,8 @@ protected:
 #endif
 
 public:
-  // Public because the meta-sandbox (rlbox_meta_sandbox) needs to forward
-  // impl_lookup_symbol through from a non-friend composition.  The other
-  // impl_* methods are already public; this one was historically protected
-  // by oversight — rlbox accesses it via the T_Sbx template where access
-  // control doesn't prevent member access from instantiation sites.
+  // Public because rlbox_meta_sandbox forwards through this from a
+  // non-friend composition.
   void* impl_lookup_symbol(const char* func_name)
   {
 #if defined(RLBOX_TRANSPORT_RPCLIB)
@@ -280,9 +256,8 @@ protected:
           }
         }
         if (dispatcher) {
-          // Parallel to the capnp path: publish (this, key) for the
-          // interceptor to recover via
-          // impl_get_executed_callback_sandbox_and_key.
+          // Mirror of the capnp path: publish (this, key) for the
+          // interceptor.
           detail::thread_local_sandbox = this;
           detail::thread_local_callback_key = reinterpret_cast<void*>(key);
           int64_t res = dispatcher(args);
@@ -341,10 +316,7 @@ public:
     }
 
 #if defined(RLBOX_TRANSPORT_RPCLIB)
-    // Pick free ports for both directions of the RPC connection.  The
-    // child-facing RPC port is chosen by the host and handed to the shim
-    // via an environment variable; likewise the callback-back-to-host port
-    // is bound by us and advertised to the shim.
+    // Pick free ports for both directions; advertise via env to the shim.
     uint16_t chosen_rpc_port = find_free_tcp_port();
     uint16_t chosen_callback_port = find_free_tcp_port();
     if (chosen_rpc_port == 0 || chosen_callback_port == 0 ||
@@ -357,11 +329,8 @@ public:
     // Start the callback server on a secondary port
     start_callback_server(chosen_callback_port);
 #elif defined(RLBOX_TRANSPORT_CAPNP)
-    // SOCK_STREAM Unix pairs.  We could use SOCK_SEQPACKET to get message
-    // boundaries for free, but Cap'n Proto's framing makes the choice
-    // transport-irrelevant — and SOCK_STREAM is the most universally
-    // available.  Both ends inherit across fork; the shim picks them up
-    // via env after exec.
+    // SOCK_STREAM Unix pairs; Cap'n Proto handles framing. Both ends
+    // inherit across fork; the shim reads them from env after exec.
     int req_pair[2];
     int cb_pair[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, req_pair) != 0) {
@@ -395,8 +364,7 @@ public:
       setenv(
         "RLBOX_CALLBACK_PORT", std::to_string(callback_port).c_str(), 1);
 #elif defined(RLBOX_TRANSPORT_CAPNP)
-      // Close our (parent-side) ends in the child so dangling fds don't
-      // confuse poll/EOF semantics later.
+      // Close parent-side ends in the child to keep EOF semantics clean.
       close(req_pair[0]);
       close(cb_pair[0]);
       setenv("RLBOX_REQ_FD", std::to_string(req_pair[1]).c_str(), 1);
@@ -416,9 +384,8 @@ public:
     child_process_handle = reinterpret_cast<void*>(static_cast<uintptr_t>(pid));
 
 #if defined(RLBOX_TRANSPORT_RPCLIB)
-    // Wait for the child's RPC server to actually accept connections
-    // before constructing the client; rpc::client does a lazy connect
-    // and wouldn't surface "not-yet-listening" as an error.
+    // Wait for the child's RPC server before constructing the client;
+    // rpc::client connects lazily and won't surface listen failures.
     if (!wait_for_tcp_listener(rpc_port, 5000)) {
       return false;
     }
@@ -429,9 +396,7 @@ public:
       return false;
     }
 #elif defined(RLBOX_TRANSPORT_CAPNP)
-    // Close child-side fds in the parent — keeping them open would prevent
-    // EOF-driven shutdown of the request loop in the shim if the parent
-    // ever restarts the connection.
+    // Close child-side fds in the parent so EOF-driven shutdown works.
     close(req_pair[1]);
     close(cb_pair[1]);
     request_fd = req_pair[0];
@@ -463,8 +428,7 @@ public:
     }
 #elif defined(RLBOX_TRANSPORT_CAPNP)
     callback_thread_stop.store(true);
-    // Closing the request fd causes the shim's request loop to see EOF and
-    // exit; closing the callback fd makes our local read return EOF.
+    // Close fds to drive EOF on both ends of both channels.
     if (request_fd >= 0) {
       shutdown(request_fd, SHUT_RDWR);
       close(request_fd);
@@ -483,19 +447,15 @@ public:
     if (child_process_handle) {
       pid_t pid =
         static_cast<pid_t>(reinterpret_cast<uintptr_t>(child_process_handle));
-      // Gracefully terminate the child process
       kill(pid, SIGTERM);
-      // Wait for the child process to exit to prevent zombies
       waitpid(pid, nullptr, 0);
       child_process_handle = nullptr;
     }
   }
 
-  // Host and child map shared memory at the same virtual address, so the
-  // "sandbox-side" representation of a pointer is just its absolute
-  // address — no offset math.  This is what lets native C code in the
-  // sandbox write absolute pointers into shared structs and have the host
-  // read the same bytes back as valid pointers.
+  // Host and child share memory at the same VA, so a "sandbox-side"
+  // pointer is just its absolute address. This is what lets sandbox code
+  // write absolute pointers into shared structs and the host read them.
   template<typename T>
   inline void* impl_get_unsandboxed_pointer(T_PointerType p) const
   {
@@ -536,13 +496,9 @@ public:
     return sandbox->impl_get_sandboxed_pointer<T>(p);
   }
 
-  // Static because rlbox_sandbox<T_Sbx>::is_in_same_sandbox calls it as
-  // T_Sbx::impl_is_in_same_sandbox(...) without an instance.  We resolve
-  // each pointer against the global registry and return true only when
-  // both land inside the *same* sandbox's shared region.
-  // RLBox's memcpy/memset guards use this as "are these two endpoints of
-  // a range on the same side of the app/sandbox boundary" — i.e. safe if
-  // they're both in the same sandbox OR both outside every sandbox.
+  // Static because rlbox calls this without an instance. Returns true
+  // when both pointers are in the same sandbox's shared region, or both
+  // are outside every sandbox.
   static inline bool impl_is_in_same_sandbox(const void* p1, const void* p2)
   {
     auto addr1 = reinterpret_cast<uintptr_t>(p1);
@@ -579,10 +535,8 @@ public:
     return reinterpret_cast<void*>(shared_memory_local_base);
   }
 
-  // Widen an already-converted argument into an int64 wire slot.  Pointer
-  // args arrive as T_PointerType (sandbox offsets) because rlbox converted
-  // tainted<T*> before calling us — so we can cast them straight into the
-  // slot with no extra translation on the host side.
+  // Widen an already-converted argument into an int64 wire slot. Pointer
+  // args arrive as T_PointerType (sandbox offsets) -- cast directly.
   template<typename A>
   static int64_t pack_slot(A&& v)
   {
@@ -604,9 +558,9 @@ public:
     detail::dynamic_check(request_fd >= 0, "Sandbox not initialized");
 #endif
 
-    // Recover the original, pre-conversion parameter types from T so we
-    // can emit ARG_POINTER for real pointer args (rlbox has already
-    // substituted them away in T_Args and T_Converted).
+    // Recover the original parameter types from T so we can emit
+    // ARG_POINTER for real pointer args (rlbox has substituted them
+    // away in T_Args / T_Converted).
     using orig_args_tuple = typename abi_detail::function_traits<T>::args_tuple;
     using orig_ret_type = typename abi_detail::function_traits<T>::return_type;
 
@@ -634,12 +588,9 @@ public:
                              arg_tags,
                              arg_values);
       int64_t raw = result.template as<int64_t>();
-      // rlbox's convert_type expects the sandbox-equivalent representation
-      // of the return value.  For pointer returns that's T_PointerType (the
-      // sandbox offset).  For scalars the caller's static_cast handles any
-      // further narrowing, so returning the original scalar type is enough;
-      // the cast from int64 truncates safely because the wire slot already
-      // holds a value representable in orig_ret_type.
+      // For pointer returns rlbox expects T_PointerType (sandbox offset).
+      // For scalars, the wire slot already holds a representable value,
+      // so the cast from int64 truncates safely.
       if constexpr (std::is_pointer_v<orig_ret_type>) {
         return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
       } else {
@@ -690,8 +641,8 @@ public:
       return 0;
     }
     try {
-      // RPC-allocates via dlmalloc in the child and returns the absolute
-      // address, which is valid on both sides thanks to same-base mapping.
+      // RPC-allocates via dlmalloc in the child; returns an absolute
+      // address valid on both sides thanks to same-base mapping.
       auto result = sandbox_client->call("malloc", size);
       return result.as<T_PointerType>();
     } catch (const std::exception&) {
@@ -712,17 +663,14 @@ public:
     }
     sandbox_client->async_call("free", p);
 #elif defined(RLBOX_TRANSPORT_CAPNP)
-    // Synchronous on this transport — keeping the fd serialized round-trips
-    // simplifies framing.  The shim's free is cheap.
+    // Synchronous; keeps framing simple, and the shim's free is cheap.
     (void)capnp_call(
       [&](wire::Request::Builder& req) { req.setRelease(static_cast<uint64_t>(p)); });
 #endif
   }
 
-  // Cast an int64 wire slot back into the callback's expected Nth argument
-  // type.  Pointer args arrive as sandbox offsets — the sandbox_callback_
-  // interceptor on the rlbox side expects T_PointerType for those, so we
-  // forward the offset unchanged.
+  // Cast an int64 wire slot back into the callback's Nth arg type.
+  // Pointer args arrive as sandbox offsets and stay that way.
   template<typename A>
   static A unpack_slot(int64_t raw)
   {
@@ -768,9 +716,8 @@ public:
       return 0;
     }
     try {
-      // Request the sandbox to create a trampoline for this callback key.
-      // The sandbox returns a function pointer (as an offset) that can be
-      // called.
+      // Sandbox creates a trampoline for the callback key and returns
+      // its address (offset) for invocation.
       auto result = sandbox_client->call("register_callback",
                                          reinterpret_cast<uintptr_t>(key));
       return result.template as<T_PointerType>();
@@ -785,21 +732,10 @@ public:
 #endif
   }
 
-  // rlbox's `sandbox_callback_interceptor` calls this when a
-  // registered host callback fires, so it can recover (sandbox*, key)
-  // — the key is the user's original function-pointer, which rlbox
-  // reinterprets back into a typed function in the interceptor body.
-  //
-  // Source of truth is the TLS pair published by the dispatch loop
-  // right before it runs the interceptor — see the callback_loop
-  // (capnp) / trigger_callback bind (rpclib).  Guarded on the *key*
-  // being set rather than the sandbox pointer, because
-  // `thread_local_sandbox` is also set in `impl_create_sandbox` on
-  // whichever thread stood the sandbox up (legacy marker from the
-  // original design).  Returns nulls when called outside an active
-  // callback — a composing layer (rlbox_meta_sandbox) uses that null
-  // return as the "process wasn't the one who fired" signal to fall
-  // through to the wasm backend.
+  // Recover (sandbox*, key) when a host callback fires. Guarded on the
+  // callback key (rather than the sandbox pointer, which is also set by
+  // impl_create_sandbox). Returns nulls outside an active callback -- the
+  // composing meta uses this as the "process didn't fire" signal.
   static inline std::pair<rlbox_process_sandbox*, void*>
   impl_get_executed_callback_sandbox_and_key()
   {

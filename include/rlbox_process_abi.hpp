@@ -4,13 +4,9 @@
 #include <tuple>
 #include <type_traits>
 
-// Shared ABI header included by the host (rlbox_process_sandbox.hpp) and
-// the child shim (rlbox_process_sandbox_shim.cpp).
-//
-// Every argument and the return value is widened to an int64_t wire slot.
-// A parallel vector of arg_type tags tells the shim how to cast each slot
-// when building the libffi cif and whether to translate sandbox offsets
-// into child-absolute addresses.
+// Shared ABI header for host and child shim. Every arg + return is
+// widened to an int64 wire slot; a parallel arg_type tag vector tells
+// the shim how to cast each slot when building the libffi cif.
 
 namespace rlbox {
 
@@ -21,17 +17,12 @@ enum arg_type : int32_t
   ARG_UINT32 = 2,
   ARG_SINT64 = 3,
   ARG_UINT64 = 4,
-  // POINTER-tagged slots carry a sandbox offset on the wire.  The shim
-  // adds g_shm_base to recover the child-absolute address before ffi_call;
-  // the host already emits offsets because rlbox converts tainted<T*> to
-  // T_PointerType (uintptr_t offset) before handing it to us.
+  // Sandbox offset on the wire; shim recovers absolute address.
   ARG_POINTER = 5,
 };
 
 namespace abi_detail {
 
-// Decompose a function type `R(Args...)` into its parts.  Only used on the
-// host side; the shim sees the tags on the wire.
 template<typename T>
 struct function_traits;
 
@@ -42,9 +33,9 @@ struct function_traits<R(Args...)>
   using args_tuple = std::tuple<Args...>;
 };
 
-// Map an *original* C++ type (pre-rlbox conversion) to a wire tag.  We
-// key on the original type so we can distinguish a real pointer from a
-// uint64_t that happens to share a width with our T_PointerType.
+// Map an original (pre-rlbox-conversion) C++ type to a wire tag. Keyed
+// on the original type so a real pointer is distinguishable from a
+// uint64_t the same width as T_PointerType.
 template<typename T>
 struct tag_of;
 

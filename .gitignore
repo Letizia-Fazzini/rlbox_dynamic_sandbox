@@ -2,7 +2,5 @@ build*/
 /target/
 /.vscode/
 wasi-sdk*
-CLAUDE.md
-test/zlib-testing
 bench/plots/
 bench/results/

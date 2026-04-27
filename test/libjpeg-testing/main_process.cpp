@@ -14,11 +14,10 @@ static double monotonic_ms()
 
 #define release_assert(cond, msg) if (!(cond)) { fputs(msg "\n", stderr); abort(); }
 
-// We're going to use RLBox in a single-threaded environment.
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
 
-// Process sandbox uses dynamic symbol resolution via dlsym in the child —
-// no RLBOX_USE_STATIC_CALLS()
+// Process sandbox resolves symbols dynamically via dlsym; no
+// RLBOX_USE_STATIC_CALLS().
 
 #include "rlbox.hpp"
 #include "rlbox_process_sandbox.hpp"
@@ -30,7 +29,6 @@ RLBOX_DEFINE_BASE_TYPES_FOR(jpeg, process);
 
 int main(int argc, char const *argv[]) {
 
-  //read in quality from stdin
   int quality = 50;
   if(argc>1) {
     quality = std::stoi(argv[1]);
@@ -52,7 +50,6 @@ int main(int argc, char const *argv[]) {
     snprintf(filename, sizeof(filename), "test_data/test_data%d.txt", d);
 
     for(int it = 0; it < iters; it++) {
-      //put input stream inside sandbox as a flat packed pixel buffer
       FILE* source = fopen(filename, "r");
       int image_width, image_height, image_channels;
       fscanf(source, "%d %d %d", &image_width, &image_height, &image_channels);
@@ -69,20 +66,17 @@ int main(int argc, char const *argv[]) {
       }
       fclose(source);
 
-      //declare output file
       FILE* destinationFile;
       if ((destinationFile = fopen("compressed.jpeg", "wb")) == NULL) {
         fprintf(stderr, "can't open output file\n");
         exit(1);
       }
 
-      //set up output buffer pointers inside sandbox
       auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
       *outBuffer = nullptr;
       auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
       *outSize = 0;
 
-      // TurboJPEG 3-call compression sequence
       double t_start = monotonic_ms();
       auto tjHandle = sandbox.invoke_sandbox_function(tjInitCompress);
 
@@ -91,12 +85,12 @@ int main(int argc, char const *argv[]) {
         tjHandle,
         sandboxSrc,
         image_width,
-        row_stride,          // pitch: bytes per row (tightly packed)
+        row_stride,
         image_height,
         TJPF_RGB,
         outBuffer,
         outSize,
-        TJSAMP_444,          // no chroma subsampling, matches JCS_RGB intent
+        TJSAMP_444,
         quality,
         0
       );
@@ -108,10 +102,8 @@ int main(int argc, char const *argv[]) {
       sandbox.invoke_sandbox_function(tjDestroy, tjHandle);
       printf("COMPRESSION_MS=%.3f\n", monotonic_ms() - t_start);
 
-      //free input buffer
       sandbox.free_in_sandbox(sandboxSrc);
 
-      //copy data from sandbox buffer "outBuffer" to "compressed.jpeg"
       auto verifiedSizePtr = outSize.copy_and_verify([](std::unique_ptr<unsigned long> size) {
         release_assert(size != nullptr, "Output size ptr must not be null");
         release_assert(*size > 0, "Output size must be greater than zero");
@@ -127,14 +119,12 @@ int main(int argc, char const *argv[]) {
       fwrite(localBuffer.get(), 1, verifiedSize, destinationFile);
       fclose(destinationFile);
 
-      // free the TurboJPEG-allocated output buffer inside the sandbox
       sandbox.free_in_sandbox(*outBuffer);
       sandbox.free_in_sandbox(outBuffer);
       sandbox.free_in_sandbox(outSize);
     }
   }
 
-  // destroy sandbox
   sandbox.destroy_sandbox();
 
   return 0;

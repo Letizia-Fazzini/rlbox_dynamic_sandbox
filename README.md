@@ -23,7 +23,7 @@ cmake --build ./build --parallel
 cmake --build ./build --target test
 ```
 
-The host↔shim wire protocol is selectable at configure time:
+The host<->shim wire protocol is selectable at configure time:
 
 ```bash
 cmake -DRLBOX_TRANSPORT=rpclib -S . -B build_rpclib   # default

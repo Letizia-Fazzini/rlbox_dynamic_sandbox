@@ -34,7 +34,7 @@ ZLIB_TESTING_DIR = REPO_ROOT / "test" / "zlib-testing"
 DEFAULT_BUILD_DIR = ZLIB_TESTING_DIR / "build"
 
 # Process-backend variants we'll drive when --process-builds is left at the
-# default.  Capnp is the default transport — rpclib is still available
+# default.  Capnp is the default transport -- rpclib is still available
 # (the CMake RLBOX_TRANSPORT flag still selects it, build_rpclib/ can
 # still be configured) but not included in standard results.  Override
 # with --process-builds=rpclib:build_rpclib to include it explicitly.
@@ -76,7 +76,7 @@ def prepare_input(build_dir: Path, source_bytes: bytes, size: int) -> None:
     """Write exactly `size` bytes to build_dir/pi.txt by repeating source_bytes."""
     target = build_dir / "pi.txt"
     if not source_bytes:
-        raise RuntimeError("empty source bytes — can't repeat to target size")
+        raise RuntimeError("empty source bytes -- can't repeat to target size")
     reps = (size + len(source_bytes) - 1) // len(source_bytes)
     blob = (source_bytes * reps)[:size]
     target.write_bytes(blob)
@@ -178,7 +178,7 @@ def main() -> int:
                          "previously rejected on zlib; M9 struct-ABI fix "
                          "landed so it works now.  adaptive uses a tiny "
                          "adler32 warmup inside main_meta to prime the "
-                         "alloc-routing — see main_meta.cpp.)")
+                         "alloc-routing -- see main_meta.cpp.)")
     ap.add_argument("--meta-build-dir", type=Path,
                     default=ZLIB_TESTING_DIR / "build_capnp",
                     help="build dir holding the meta `main_meta` binary "
@@ -210,8 +210,8 @@ def main() -> int:
     if not shapes:
         print("[bench] --shape cannot be empty", file=sys.stderr)
         return 1
-    # Binary filename for (shape, backend).  Native is shape-agnostic —
-    # it always runs bench_native — but we still tag its rows with each
+    # Binary filename for (shape, backend).  Native is shape-agnostic --
+    # it always runs bench_native -- but we still tag its rows with each
     # requested shape so per-shape plots have a baseline.
     shape_bins = {
         "loop":   {"wasm2c": "main",         "process": "main_process"},
@@ -260,7 +260,7 @@ def main() -> int:
         if seed_dir is None:
             seed_dir = process_builds[0][1]
     if seed_dir is None:
-        print("[bench] nothing to do — all backends disabled", file=sys.stderr)
+        print("[bench] nothing to do -- all backends disabled", file=sys.stderr)
         return 1
 
     bench_native = ensure_bench_native(wasm2c_build_dir)
@@ -300,7 +300,7 @@ def main() -> int:
             for d in write_dirs:
                 prepare_input(d, seed_bytes, size)
             for level in levels:
-                # Native reference — workload doesn't depend on shape, so
+                # Native reference -- workload doesn't depend on shape, so
                 # we only run it once per (size, level), then tag the
                 # resulting rows with every requested shape below.  Meta
                 # also only runs on the `loop` shape (no stress variant).

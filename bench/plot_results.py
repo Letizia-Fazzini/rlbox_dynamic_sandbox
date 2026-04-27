@@ -335,7 +335,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not args.csv.exists():
-        print(f"[plot] {args.csv} not found — run run_benchmarks.py first, "
+        print(f"[plot] {args.csv} not found -- run run_benchmarks.py first, "
               f"or pass --csv <path>")
         return 1
 

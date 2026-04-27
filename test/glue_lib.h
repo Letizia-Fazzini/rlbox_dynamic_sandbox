@@ -7,13 +7,9 @@
 extern "C" {
 #endif
 
-/*
- * Test library exposed to the process sandbox via dlsym(RTLD_DEFAULT, ...).
- *
- * All functions use int64_t for parameters and return value because the
- * shim's invoke handler calls functions via libffi with ffi_type_sint64
- * for every argument and for the return value.
- */
+// Test library resolved by the process sandbox via dlsym(RTLD_DEFAULT,...).
+// All params/returns are int64_t because the shim invokes via libffi with
+// ffi_type_sint64 throughout.
 
 int64_t glue_noop(void);
 int64_t glue_add(int64_t a, int64_t b);

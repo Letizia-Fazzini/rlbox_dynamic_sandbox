@@ -1,14 +1,5 @@
-/*
- * Standalone native-zlib reference for the sandbox benchmark.
- * Mirrors the compression loop in zlib-testing's main.cpp so the numbers
- * are comparable: CHUNK=16384, fread-deflate-fwrite in a tight loop.
- *
- * Usage: ./bench_native <input_path> <level>
- * Output: "NATIVE_MS=<elapsed>\n"
- *
- * The wall-clock measurement brackets only the compression work — file
- * open and setup happen outside, matching the sandbox mains' accumulators.
- */
+// Native-zlib reference for the sandbox benchmark, mirroring main.cpp's
+// compression loop. Output: "COMPRESSION_MS=<elapsed>".
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>

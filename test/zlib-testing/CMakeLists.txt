@@ -170,7 +170,7 @@ target_include_directories(main PUBLIC ${rlbox_SOURCE_DIR}/code/include
 target_link_libraries(main zlib_sandboxed pthread ZLIB::ZLIB)
 
 # One-shot "stress" variant: one deflate(Z_FINISH) invoke over the whole
-# stream. Amortizes per-call overhead — the companion to main_process_stress
+# stream. Amortizes per-call overhead -- the companion to main_process_stress
 # so process fork() cost is paid once per compression.
 add_executable(main_stress main_stress.cpp)
 target_include_directories(main_stress PUBLIC ${rlbox_SOURCE_DIR}/code/include
@@ -225,7 +225,7 @@ add_dependencies(main_process sandbox_shim zlib_process_wrapper)
 
 add_executable(bench_native ${CMAKE_CURRENT_SOURCE_DIR}/bench_native.cpp)
 
-# Process-backed "stress" variant — one deflate invoke per stream.
+# Process-backed "stress" variant -- one deflate invoke per stream.
 add_executable(main_process_stress
                main_process_stress.cpp
                ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp)

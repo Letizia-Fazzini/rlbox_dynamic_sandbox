@@ -1,11 +1,6 @@
-// One-shot zlib compression via rlbox_process_sandbox — counterpart to
-// main_stress.cpp (wasm2c). Same shape: read the entire input, allocate one
-// sandbox input + one compressBound()-sized output, and invoke
-// deflate(Z_FINISH) exactly once. With a single invoke, the per-call fork()
-// cost is paid once per stream instead of per 16KB chunk — which is where
-// the process backend stops being hundreds-of-forks-bottlenecked and native
-// execution (no wasm2c bounds checks, no 32-bit-heap layout) can actually
-// win on compression-heavy streams.
+// One-shot zlib compression via rlbox_process_sandbox. Read the entire
+// input, allocate one sandbox input + one compressBound()-sized output,
+// invoke deflate(Z_FINISH) once.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

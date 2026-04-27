@@ -17,7 +17,7 @@ option(RLBOX_DYNAMIC_BUILD_TESTS "Build unit + integration tests" ON)
 #
 # The host<->shim wire protocol is pluggable at compile time.  rpclib gives us
 # a small, dependency-light baseline (msgpack + asio over TCP loopback).  capnp
-# swaps in Cap'n Proto serialization over Unix abstract sockets — fewer bytes
+# swaps in Cap'n Proto serialization over Unix abstract sockets -- fewer bytes
 # on the wire, no event-loop wrapper, and no localhost TCP setup cost.
 set(RLBOX_TRANSPORT "capnp" CACHE STRING
     "Wire transport for host<->shim RPC: rpclib | capnp (capnp is the default;

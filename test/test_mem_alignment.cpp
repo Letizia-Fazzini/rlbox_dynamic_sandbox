@@ -44,9 +44,8 @@ TEST_CASE("os_mmap_aligned produces 2MB alignment", "[mem][alignment]")
 TEST_CASE("os_mmap_aligned produces 4GB alignment (matches sandbox config)",
           "[mem][alignment]")
 {
-  // This is the alignment actually used in impl_create_sandbox so it's the
-  // most important invariant to validate.  If this ever fails, pointer
-  // translation through the shared-memory base address will misbehave.
+  // 4GB is the alignment used in impl_create_sandbox; pointer translation
+  // depends on this invariant.
   void* p = os_mmap_aligned(kOneMB, kFourGB);
   REQUIRE(p != nullptr);
   REQUIRE(is_aligned(p, kFourGB));
@@ -56,9 +55,8 @@ TEST_CASE("os_mmap_aligned produces 4GB alignment (matches sandbox config)",
 TEST_CASE("os_mmap_aligned returns readable/writable memory when re-mapped",
           "[mem][alignment]")
 {
-  // The reservation from os_mmap_aligned is PROT_NONE. Overlay it with a
-  // real mapping (as impl_create_sandbox does with the memfd) and make sure
-  // the aligned address is usable.
+  // os_mmap_aligned reserves PROT_NONE; overlay with a real mapping
+  // (as impl_create_sandbox does with the memfd) and use it.
   void* p = os_mmap_aligned(kOneMB, kOneMB);
   REQUIRE(p != nullptr);
 

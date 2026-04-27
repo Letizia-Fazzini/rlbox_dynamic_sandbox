@@ -70,12 +70,9 @@ static void init_shm()
     int fd = atoi(fd_env);
     g_shm_size = atoll(size_env);
     uintptr_t want_base = (uintptr_t)strtoull(base_env, nullptr, 10);
-    // Map the memfd at the *same* virtual address the host chose.  This
-    // is what keeps pointers consistent: native C code running in the
-    // child can write absolute pointers into shared-memory structs and
-    // the host reads them back as valid host addresses.  MAP_FIXED_NOREPLACE
-    // fails (instead of silently overwriting) if something is already
-    // mapped at that range.
+    // Map at the host's chosen VA so absolute pointers stay valid on
+    // both sides. NOREPLACE fails fast on collision instead of silently
+    // overwriting.
     int flags = MAP_SHARED | MAP_FIXED_NOREPLACE;
     void* want_addr = (void*)want_base;
     void* got = mmap(
@@ -84,8 +81,7 @@ static void init_shm()
       g_shm_base = NULL;
     } else {
       g_shm_base = got;
-      // Initialize dlmalloc mspace. Set locked=1 to ensure thread safety
-      // between the RPC server thread and the library main thread.
+      // locked=1 for thread safety between RPC server thread and library.
       g_mspace = create_mspace_with_base(g_shm_base, g_shm_size, 1);
       init_shared_callback_keys();
     }
@@ -93,35 +89,25 @@ static void init_shm()
   g_in_init = false;
 }
 
-// --- Callback Trampoline Pool ---
-// Each trampoline is a real function address that, when called,
-// sends an RPC message back to the host.
+// Callback trampoline pool. Each trampoline is a real function address
+// that calls back to the host when invoked.
 
 #if defined(RLBOX_TRANSPORT_RPCLIB)
 static std::unique_ptr<rpc::client> g_callback_client;
 #elif defined(RLBOX_TRANSPORT_CAPNP)
 static int g_callback_fd = -1;
-// Workers fire callbacks from independent processes that share g_callback_fd
-// via fork inheritance.  A mutex inside one process can't coordinate writes
-// across processes, but in practice contention is rare and the pool's worker
-// is single-threaded, so the only intra-process collisions come from the
-// shim parent's request handler — which we never have firing callbacks.
-// We still take this mutex defensively in case a worker becomes
-// multi-threaded in the future.
+// Defensive: worker is single-threaded today, but the mutex guards us if
+// a future worker becomes multi-threaded.
 static std::mutex g_callback_fd_mutex;
 #endif
-// Compile-time-fixed because each slot needs a distinct trampoline function
-// with a unique address.  Overridable via -DRLBOX_CALLBACK_SLOTS=N at build
-// time; bump if a library registers more callbacks than fit.
+// Each slot needs a distinct trampoline with a unique address; size fixed
+// at build time. Overridable via -DRLBOX_CALLBACK_SLOTS=N.
 #ifndef RLBOX_CALLBACK_SLOTS
 #  define RLBOX_CALLBACK_SLOTS 64
 #endif
 static constexpr size_t k_callback_slots = RLBOX_CALLBACK_SLOTS;
-// The slot array lives in the shared mspace so that pre-forked workers
-// (which inherit the *pointer* at fork time) read up-to-date keys via
-// shared memory, not their own private snapshot. atomic<uintptr_t> is
-// lock-free and standard-layout on x86_64; placement-new initializes
-// each slot to 0.
+// Slot array lives in the shared mspace so pre-forked workers see fresh
+// keys through shared memory rather than their private fork snapshot.
 static std::atomic<uintptr_t>* g_callback_keys = nullptr;
 
 static void init_shared_callback_keys()
@@ -142,8 +128,7 @@ static void init_shared_callback_keys()
 }
 
 #if defined(RLBOX_TRANSPORT_CAPNP)
-// Helper: send a CallbackRequest, await CallbackResponse.  Mutex-serialized
-// for the same reason capnp_call is on the host side.
+// Send a CallbackRequest and await the response. Mutex-serialized.
 static int64_t fire_callback(uintptr_t key,
                              int64_t a,
                              int64_t b,
@@ -172,11 +157,9 @@ static int64_t fire_callback(uintptr_t key,
 }
 #endif
 
-// One trampoline per slot index.  Each instantiation is a distinct function
-// with its own address — that's what the host hands the sandboxed library as
-// the callback target.  System V x86_64 ABI matches the C calling
-// convention, so no extern "C" needed; the unused trailing args are
-// harmless when the library calls through with fewer arguments.
+// One trampoline per slot index. Each instantiation is a distinct
+// function with its own address. SysV x86_64 matches C calling conv, so
+// no extern "C" needed; unused trailing args are harmless.
 template <size_t I>
 static int64_t trampoline_impl(int64_t a, int64_t b, int64_t c, int64_t d)
 {
@@ -229,17 +212,16 @@ extern "C"
     if (!g_mspace && !g_in_init) {
       std::call_once(g_init_once, init_shm);
 
-      // If not yet initialized (called within init_shm), use bootstrap buffer
-      // with a size header for realloc support
+      // Bootstrap: shm not yet ready (called inside init_shm). Allocate
+      // out of g_bootstrap_buf with an inline size header so realloc works.
       if (!g_mspace) {
-        // Ensure total_needed is 8-byte aligned
         size_t total_needed = ((size + 7) & ~7) + sizeof(size_t);
         if (g_bootstrap_offset + total_needed > sizeof(g_bootstrap_buf)) {
           return NULL;
         }
         void* raw = &g_bootstrap_buf[g_bootstrap_offset];
         g_bootstrap_offset += total_needed;
-        *(size_t*)raw = size; // Store size for bootstrap realloc
+        *(size_t*)raw = size;
         return (char*)raw + sizeof(size_t);
       }
     }
@@ -252,10 +234,10 @@ extern "C"
     if (!ptr)
       return;
 
-    // Check if pointer is in bootstrap buffer
+    // Bootstrap allocations leak; we never reclaim that buffer.
     if ((char*)ptr >= g_bootstrap_buf &&
         (char*)ptr < g_bootstrap_buf + sizeof(g_bootstrap_buf)) {
-      return; // Can't free bootstrap memory
+      return;
     }
 
     if (g_mspace) {
@@ -265,7 +247,6 @@ extern "C"
 
   void* calloc(size_t nmemb, size_t size)
   {
-    // Check for integer overflow before multiplication
     if (nmemb > 0 && size > (size_t)-1 / nmemb) {
       return NULL;
     }
@@ -274,7 +255,6 @@ extern "C"
       return mspace_calloc(g_mspace, nmemb, size);
     }
 
-    // Falls back to bootstrap + memset
     size_t total = nmemb * size;
     void* ptr = malloc(total);
     if (ptr) {
@@ -292,7 +272,6 @@ extern "C"
       return NULL;
     }
 
-    // Handle realloc from bootstrap buffer
     if ((char*)ptr >= g_bootstrap_buf &&
         (char*)ptr < g_bootstrap_buf + sizeof(g_bootstrap_buf)) {
       size_t old_size = *((size_t*)ptr - 1);
@@ -312,9 +291,9 @@ extern "C"
 
 } // extern "C"
 
-// --- libffi dispatch helpers (shared by inline and worker-pool paths) ---
+// libffi dispatch helpers shared by inline and worker-pool paths.
 
-// Map a wire arg_type tag to its libffi type.  Returns NULL if unknown.
+// Map a wire arg_type tag to its libffi type. NULL if unknown.
 static ffi_type* ffi_type_for_tag(int32_t tag)
 {
   switch (tag) {
@@ -328,21 +307,16 @@ static ffi_type* ffi_type_for_tag(int32_t tag)
   }
 }
 
-// Bounded — keeps stack arrays in do_ffi_call sized at compile time
-// and gives worker_main something to validate the wire-supplied nargs
-// against.  Practical signatures we care about are <10 args.
+// Bounds the stack arrays in do_ffi_call and validates wire nargs.
 static constexpr size_t k_max_args = 32;
 
-// Run the actual ffi_call.  Caller is responsible for ensuring the
-// surrounding process has the right isolation properties — we either
-// invoke this in a freshly-fork()ed child (inline path) or in a
-// pre-forked worker that exits immediately afterward (pool path).
+// Run ffi_call. Caller must ensure isolation -- we run this either in a
+// freshly-forked child (inline path) or in a pre-forked worker that
+// exits immediately afterward (pool path).
 //
-// All scratch is on the stack: this function is called *after* fork()
-// in both paths, and the dlmalloc mspace mutex lives in the shared
-// memfd.  If a thread other than the caller held it at fork time, any
-// post-fork mspace_malloc in the child would deadlock — so we simply
-// don't allocate here.
+// Stack scratch only: the dlmalloc mspace mutex lives in shared memory,
+// and post-fork allocation would deadlock if another thread held it at
+// fork time. Don't introduce allocations here.
 static int64_t do_ffi_call(uintptr_t func_addr,
                            int32_t ret_tag,
                            const int32_t* arg_tags,
@@ -359,8 +333,7 @@ static int64_t do_ffi_call(uintptr_t func_addr,
   ffi_type* types[k_max_args];
   void* values[k_max_args];
   void* ptr_storage[k_max_args];
-  // Local copy so taking &arg_value_storage[i] yields stable storage
-  // independent of the caller's buffer.
+  // Local copy so &arg_value_storage[i] is independent of caller's buffer.
   int64_t arg_value_storage[k_max_args];
 
   for (size_t i = 0; i < nargs; ++i) {
@@ -389,8 +362,8 @@ static int64_t do_ffi_call(uintptr_t func_addr,
     return 0;
   }
 
-  // ffi_arg-sized buffer is the portable landing pad for sub-64-bit
-  // return widths; zero-initialize so unused bits are defined.
+  // ffi_arg is the portable landing pad for sub-64-bit returns; zero
+  // so unused bits are defined.
   ffi_arg ret_buf = 0;
   void* func_ptr = (void*)func_addr;
   if (ret_tag == rlbox::ARG_VOID) {
@@ -406,8 +379,7 @@ static int64_t do_ffi_call(uintptr_t func_addr,
     case rlbox::ARG_SINT64:  return (int64_t)ret_buf;
     case rlbox::ARG_UINT64:  return (int64_t)(uint64_t)ret_buf;
     case rlbox::ARG_POINTER: {
-      // Pointer return flows back as an absolute address, which the host
-      // can dereference directly thanks to same-base mapping.
+      // Pointer returns flow back as absolute addresses (same-base mapping).
       void* p = *(void**)&ret_buf;
       return (int64_t)(uintptr_t)p;
     }
@@ -415,19 +387,10 @@ static int64_t do_ffi_call(uintptr_t func_addr,
   return 0;
 }
 
-// --- Pre-forked worker pool ---
-//
-// The pool hides per-call fork() latency from the critical path while
-// preserving the per-call isolation invariant: each invoke still runs
-// in a fresh address space that exits immediately after the call (one
-// call per child).  Pattern follows SOCK Zygotes (USENIX ATC '18,
-// https://www.usenix.org/system/files/conference/atc18/atc18-oakes.pdf)
-// and the Android Zygote: fork from a small, already-initialized parent
-// off the critical path so only the inherited page-table copy is paid.
-//
-// Configurable via env var RLBOX_WORKER_POOL_SIZE.  Default 4; setting
-// 0 disables the pool and forces every invoke through inline fork (the
-// pre-pool behavior, kept as a fallback path).
+// Pre-forked worker pool. Each worker still runs one call and exits
+// (one-call-per-child preserved); the pool just hides fork() latency.
+// Configurable via RLBOX_WORKER_POOL_SIZE; 0 disables and falls back
+// to inline fork.
 
 struct Worker
 {
@@ -485,10 +448,8 @@ static bool write_full(int fd, const void* buf, size_t n)
   return true;
 }
 
-// Worker entry point.  Reads exactly one job, runs it, writes the int64
-// result, exits.  Anything the call mutates dies with the process.
-// Stack arrays only: see do_ffi_call comment about post-fork allocator
-// safety.
+// Worker entry point: read one job, run it, write the result, exit.
+// Stack arrays only -- see do_ffi_call for the post-fork allocator caveat.
 static void worker_main(int req_fd, int resp_fd)
 {
   WireJobHeader hdr;
@@ -546,8 +507,8 @@ static Worker spawn_worker()
   return Worker{ pid, req_pipe[1], resp_pipe[0] };
 }
 
-// Pop a ready worker.  Returns Worker with pid==-1 if pool is empty so
-// the caller can fall back to inline fork.
+// Pop a ready worker. Returns pid==-1 on empty so the caller can fall
+// back to inline fork.
 static Worker try_acquire_worker()
 {
   std::lock_guard<std::mutex> lock(g_pool_mutex);
@@ -560,8 +521,7 @@ static Worker try_acquire_worker()
   return w;
 }
 
-// Send job to worker, read result, reap.  Caller has already removed
-// the worker from the pool.
+// Send job, read result, reap. Caller has already popped the worker.
 static int64_t dispatch_to_worker(Worker w,
                                   uintptr_t func_addr,
                                   int32_t ret_tag,
@@ -602,8 +562,8 @@ static void refill_loop()
         return;
       }
     }
-    // fork() outside the lock so concurrent acquires aren't blocked
-    // behind the slow page-table copy.
+    // fork() outside the lock so concurrent acquires don't block on
+    // the page-table copy.
     Worker w = spawn_worker();
     if (w.pid == -1) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -619,7 +579,7 @@ static void refill_loop()
 static void start_worker_pool()
 {
   if (!g_mspace) {
-    return;  // SHM init failed; pool can't run library calls usefully
+    return;
   }
   const char* size_env = getenv("RLBOX_WORKER_POOL_SIZE");
   size_t target = 4;
@@ -631,32 +591,26 @@ static void start_worker_pool()
     target = (size_t)parsed;
   }
   if (target == 0) {
-    return;  // pool disabled; every invoke uses inline fork
+    return;
   }
   g_pool_target = target;
   std::thread refill(refill_loop);
   refill.detach();
 }
 
-// --- Per-operation handlers (transport-agnostic) ---
-//
-// Both the rpclib and capnp request loops dispatch into these.  Keeping the
-// dispatch logic shared means the wire transport is the only thing we're
-// actually swapping when comparing.
+// Per-operation handlers shared by both transport request loops.
 
-// dlsym in the child.  The returned address is absolute: the host shares
-// the child's VA for shared memory and treats function addresses as raw
-// pointers, which it hands back unchanged in invoke.
+// dlsym in the child. Returns an absolute address; the host hands it back
+// unchanged at invoke time thanks to same-base mapping.
 static uintptr_t handle_lookup_symbol(const char* name)
 {
   void* ptr = dlsym(RTLD_DEFAULT, name);
   return (uintptr_t)ptr;
 }
 
-// Reject any pointer outside the shared region — dlmalloc with HAVE_MMAP
-// can satisfy huge requests via its own mmap path, which would land
-// outside the mspace and be unreachable from the host.  Returns the
-// absolute address (same on both sides).
+// Reject pointers outside the shared region: dlmalloc with HAVE_MMAP
+// can satisfy huge requests outside the mspace, which the host can't
+// reach. Returns the absolute address.
 static uintptr_t handle_allocate(size_t size)
 {
   void* ptr = malloc(size);
@@ -679,13 +633,9 @@ static void handle_release(uintptr_t abs_addr)
   }
 }
 
-// Function invocation.  Dispatch path: try a pre-forked worker; if the
-// pool is empty (or disabled via RLBOX_WORKER_POOL_SIZE=0), fall back to
-// inline fork so we never block on refill.  Either path preserves the
-// one-call-per-child isolation invariant.
-//
-// POINTER-tagged args carry absolute addresses on the wire (host and child
-// share the VA range for shared memory).
+// Try a pre-forked worker; fall back to inline fork on empty/disabled
+// pool. Either path keeps one-call-per-child isolation. POINTER args
+// are absolute addresses on the wire (same-base mapping).
 static int64_t handle_invoke(uintptr_t func_addr,
                              int32_t ret_tag,
                              const std::vector<int32_t>& arg_tags,
@@ -706,11 +656,8 @@ static int64_t handle_invoke(uintptr_t func_addr,
     return dispatch_to_worker(w, func_addr, ret_tag, arg_tags, arg_values);
   }
 
-  // Fallback: inline fork.  Same isolation as the pool path; just pays
-  // the page-table copy on the critical path.  do_ffi_call uses only
-  // stack scratch so the post-fork child never touches the mspace
-  // mutex (which may have been held by another thread in the parent at
-  // fork time).
+  // Fallback: inline fork. Same isolation; pays the page-table copy on
+  // the critical path.
   int pipefd[2];
   if (pipe(pipefd) == -1) {
     return 0;
@@ -743,9 +690,9 @@ static int64_t handle_invoke(uintptr_t func_addr,
   return parent_rc;
 }
 
-// Returns the trampoline's absolute address — the host uses it as a
-// T_PointerType which the sandboxed library then calls directly.
-// compare_exchange races safely against concurrent registrations.
+// Returns the trampoline's absolute address; sandboxed library calls
+// it directly. compare_exchange races safely against concurrent
+// registrations.
 static uintptr_t handle_register_callback(uintptr_t host_key)
 {
   if (!g_callback_keys) {
@@ -774,14 +721,10 @@ static void handle_unregister_callback(uintptr_t host_key)
   }
 }
 
-// --- RPC Server Implementation ---
-
 #if defined(RLBOX_TRANSPORT_RPCLIB)
 static void start_rpc_server()
 {
-  // The host picks both ports by binding to port 0 and passes them here
-  // via env vars.  If either is missing we can't communicate with the
-  // host — bail out rather than listen on an arbitrary default.
+  // Host passes both ports via env. Bail if missing.
   const char* rpc_port_env = getenv("RLBOX_RPC_PORT");
   const char* cb_port_env = getenv("RLBOX_CALLBACK_PORT");
   if (!rpc_port_env || !cb_port_env) {
@@ -793,7 +736,6 @@ static void start_rpc_server()
     return;
   }
 
-  // Client to talk back to the host for callbacks
   g_callback_client =
     std::make_unique<rpc::client>("127.0.0.1", host_callback_port);
 
@@ -818,15 +760,10 @@ static void start_rpc_server()
     handle_unregister_callback(host_key);
   });
 
-  // Workers can die mid-write if the library aborts; without this an
-  // EPIPE on the request pipe would kill the shim parent.
+  // Survive worker EPIPE if a library call aborts mid-write.
   signal(SIGPIPE, SIG_IGN);
 
-  // Pool start needs g_mspace ready (the shared callback array lives
-  // there).  init_shm() is normally lazy via the malloc override but by
-  // the time the RPC server is up libc/library constructors have called
-  // malloc, so g_mspace is set.  Call it eagerly here as belt-and-
-  // suspenders in case a future change defers all allocation.
+  // Eager init in case nothing has triggered the malloc override yet.
   std::call_once(g_init_once, init_shm);
   start_worker_pool();
 
@@ -835,8 +772,7 @@ static void start_rpc_server()
 #elif defined(RLBOX_TRANSPORT_CAPNP)
 static void start_rpc_server()
 {
-  // Both fds were created by the host (socketpair) and inherited across
-  // exec.  Without them we can't communicate, so bail.
+  // Both fds inherit from the host across exec. Bail if missing.
   const char* req_fd_env = getenv("RLBOX_REQ_FD");
   const char* cb_fd_env = getenv("RLBOX_CB_FD");
   if (!req_fd_env || !cb_fd_env) {
@@ -853,9 +789,7 @@ static void start_rpc_server()
   std::call_once(g_init_once, init_shm);
   start_worker_pool();
 
-  // Single-threaded request loop.  Each iteration: read one Request,
-  // dispatch via the shared handlers, write one Response.  EOF on the
-  // request fd (host side closed) ends the loop.
+  // Single-threaded request loop. EOF on req_fd ends the loop.
   while (true) {
     capnp::MallocMessageBuilder out;
     auto resp = out.initRoot<rlbox::wire::Response>();
@@ -911,7 +845,7 @@ static void start_rpc_server()
           break;
       }
     } catch (const kj::Exception&) {
-      // EOF or framing error — host has gone away.  Stop the loop.
+      // EOF or framing error: host has gone away.
       reply = false;
       break;
     }
@@ -927,15 +861,11 @@ static void start_rpc_server()
 }
 #endif
 
-/**
- * This constructor runs automatically when LD_PRELOAD loads this library
- * into the sandboxed process. It spawns the RPC server thread so the
- * process can immediately begin communicating with the RLBox host.
- */
+// Runs when LD_PRELOAD loads this library into the sandboxed process.
+// Spawns the RPC server on its own thread so it doesn't block the
+// library's main execution.
 __attribute__((constructor)) static void init_sandbox_shim()
 {
-  // We start the server in a separate thread so we don't block
-  // the main execution of the library/program being sandboxed.
   std::thread rpc_thread(start_rpc_server);
   rpc_thread.detach();
 }

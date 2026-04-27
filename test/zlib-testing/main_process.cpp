@@ -15,11 +15,10 @@ static double monotonic_ms()
 
 #define release_assert(cond, msg) if (!(cond)) { fputs(msg "\n", stderr); abort(); }
 
-// We're going to use RLBox in a single-threaded environment.
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
 
-// Process sandbox uses dynamic symbol resolution via dlsym in the child —
-// no RLBOX_USE_STATIC_CALLS()
+// Process sandbox resolves symbols dynamically via dlsym in the child;
+// no RLBOX_USE_STATIC_CALLS().
 
 #include "rlbox.hpp"
 #include "rlbox_process_sandbox.hpp"
@@ -32,8 +31,8 @@ rlbox_load_structs_from_library(zlib);
 
 RLBOX_DEFINE_BASE_TYPES_FOR(zlib, process);
 
-// Wrapper functions live in zlib_wrapper.c inside the child; the child
-// exposes them via -rdynamic so dlsym(RTLD_DEFAULT, ...) finds them.
+// Wrappers live in zlib_wrapper.c inside the child, exposed via -rdynamic
+// so dlsym(RTLD_DEFAULT, ...) finds them.
 extern "C" {
   int deflateInitWrapper(z_streamp strm, int level);
   int inflateInitWrapper(z_streamp strm);
@@ -91,9 +90,8 @@ int main(int argc, char const *argv[]) {
         return Z_ERRNO;
     }
 
-    // malloc_in_sandbox(0) is undefined on at least wasm2c; when the input
-    // size is an exact multiple of CHUNK the final Z_FINISH iteration has
-    // in_size == 0. Pad to 1 so both backends behave the same.
+    // malloc_in_sandbox(0) aborts on wasm2c; pad to 1 on the empty
+    // Z_FINISH iteration so both backends behave the same.
     auto sandboxedIn = sandbox.malloc_in_sandbox<char>(in_size > 0 ? in_size : 1);
     if (in_size > 0) {
       rlbox::memcpy(sandbox, sandboxedIn, &in, in_size);

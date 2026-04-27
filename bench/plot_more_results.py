@@ -182,7 +182,7 @@ def plot_overhead(rows: list[dict], meds: dict, out_path: Path) -> None:
         ax.set_title(f"quality level {level}")
         ax.set_xlabel("input size")
         ax.grid(True, axis="y", linestyle=":", alpha=0.5)
-    axes[0][0].set_ylabel("slowdown vs native (×)")
+    axes[0][0].set_ylabel("slowdown vs native (x)")
     axes[0][-1].legend(loc="best")
     fig.suptitle("sandbox overhead relative to native libjpeg-turbo")
     fig.tight_layout()
@@ -237,7 +237,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not args.csv.exists():
-        print(f"[plot] {args.csv} not found — run run_benchmarks.py first")
+        print(f"[plot] {args.csv} not found -- run run_benchmarks.py first")
         return 1
     args.out_dir.mkdir(parents=True, exist_ok=True)
 

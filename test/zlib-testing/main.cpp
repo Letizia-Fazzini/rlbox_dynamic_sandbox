@@ -15,15 +15,10 @@ static double monotonic_ms()
 
 #define release_assert(cond, msg) if (!(cond)) { fputs(msg "\n", stderr); abort(); }
 
-// We're going to use RLBox in a single-threaded environment.
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
-// The fixed configuration line we need to use for the wasm2c sandbox.
-// It specifies that all calls into the sandbox are resolved statically.
 #define RLBOX_USE_STATIC_CALLS() rlbox_wasm2c_sandbox_lookup_symbol
-// The rlbox wasm2c plugin requires that you provide the wasm2c module's name
 #define RLBOX_WASM2C_MODULE_NAME zlib
 
-// Include the produced header from wasm2c
 #include "zlib.wasm.h"
 #include "rlbox.hpp"
 #include "rlbox_wasm2c_sandbox.hpp"
@@ -33,11 +28,9 @@ static double monotonic_ms()
 using namespace rlbox;
 
 rlbox_load_structs_from_library(zlib);
-
-// Define base type for zlib using the wasm2c sandbox
 RLBOX_DEFINE_BASE_TYPES_FOR(zlib, wasm2c);
 
-// Forward declarations of wrapper functions (defined in zlib_wrapper.c, compiled into the wasm module).
+// Wrappers from zlib_wrapper.c, compiled into the wasm module.
 extern "C" {
   int deflateInitWrapper(z_streamp strm, int level);
   int inflateInitWrapper(z_streamp strm);
@@ -101,8 +94,8 @@ int main(int argc, char const *argv[]) {
         return Z_ERRNO;
     }
 
-    // malloc_in_sandbox(0) aborts on wasm2c; when the input size is an exact
-    // multiple of CHUNK the final Z_FINISH iteration has in_size == 0.
+    // malloc_in_sandbox(0) aborts on wasm2c; pad to 1 when in_size == 0
+    // (final Z_FINISH iteration when input is an exact multiple of CHUNK).
     auto sandboxedIn = sandbox.malloc_in_sandbox<char>(in_size > 0 ? in_size : 1);
     if (in_size > 0) {
       rlbox::memcpy(sandbox, sandboxedIn, &in, in_size);

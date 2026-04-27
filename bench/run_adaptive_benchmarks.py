@@ -102,7 +102,7 @@ def _write_input(target: Path, source_bytes: bytes, size: int, library: Library 
     binaries (which fscanf the header) always read a consistent file.
     """
     if not source_bytes:
-        raise RuntimeError("empty source bytes — can't repeat to target size")
+        raise RuntimeError("empty source bytes -- can't repeat to target size")
 
     nl = source_bytes.find(b"\n")
     if nl == -1:

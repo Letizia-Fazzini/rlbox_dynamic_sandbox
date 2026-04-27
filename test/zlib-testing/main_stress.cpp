@@ -1,11 +1,6 @@
-// One-shot zlib compression via wasm2c — reads the whole input, allocates a
-// single sandbox input buffer + a compressBound()-sized output buffer, and
-// calls deflate(Z_FINISH) exactly once. Collapses the hundreds of per-chunk
-// invokes (and per-invoke sandbox crossings) from main.cpp into one large
-// invoke, so wasm2c's per-call overhead is amortized across the entire
-// stream. Counterpart to main_process_stress.cpp — together they form the
-// "process can beat wasm" demonstration: with a single invoke per stream,
-// the process backend's per-call fork() is paid once instead of per chunk.
+// One-shot zlib compression via wasm2c: read the whole input, allocate a
+// single sandbox input buffer + a compressBound()-sized output buffer,
+// and call deflate(Z_FINISH) exactly once.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,7 +71,7 @@ int main(int argc, char const *argv[]) {
   });
   if (verifiedInit != Z_OK) return Z_ERRNO;
 
-  // Worst-case output from host libz — no sandbox crossing.
+  // Worst-case output from host libz; no sandbox crossing.
   size_t out_cap = compressBound((uLong)in_size);
 
   double t0 = monotonic_ms();

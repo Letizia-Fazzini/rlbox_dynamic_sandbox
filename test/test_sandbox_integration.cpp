@@ -12,20 +12,9 @@
 
 using rlbox::rlbox_process_sandbox;
 
-/*
- * Integration tests that spin up a real sandboxed child process.
- *
- * These depend on:
- *   - TEST_SANDBOX_WRAPPER_PATH : absolute path to the test wrapper
- *     executable that LD_PRELOADs sandbox_shim.so.  The wrapper statically
- *     links the test glue library so that dlsym(RTLD_DEFAULT, ...) can
- *     resolve glue_* symbols inside the child.
- *   - sandbox_shim.so must be present in the CWD when the test runs
- *     (impl_create_sandbox hard-codes LD_PRELOAD="./sandbox_shim.so").
- *
- * Ports are picked dynamically by the host via bind-to-0, so multiple
- * sandboxes can coexist and there's no TIME_WAIT cooldown between tests.
- */
+// Integration tests that spin up a real sandboxed child process.
+// Requires TEST_SANDBOX_WRAPPER_PATH (set by CMake) and ./sandbox_shim.so
+// in CWD (impl_create_sandbox hard-codes LD_PRELOAD).
 
 #ifndef TEST_SANDBOX_WRAPPER_PATH
 #  error \
@@ -33,12 +22,10 @@ using rlbox::rlbox_process_sandbox;
 #endif
 
 namespace {
-// Exposes a few internals for targeted integration testing.  Helpers are
-// transport-agnostic so the same tests run under both rpclib and capnp.
+// Transport-agnostic harness exposing select internals for testing.
 class IntegrationHarness : public rlbox_process_sandbox
 {
 public:
-  // True when the host<->shim channel is up and ready for calls.
   bool transport_alive() const
   {
 #if defined(RLBOX_TRANSPORT_RPCLIB)
@@ -50,15 +37,12 @@ public:
 #endif
   }
 
-  // Direct symbol lookup, exposing the wire return as uintptr_t.
   uintptr_t raw_lookup_symbol(const std::string& name)
   {
     return reinterpret_cast<uintptr_t>(this->impl_lookup_symbol(name.c_str()));
   }
 
-  // Send a typed invoke payload exactly as the wire schema expects, without
-  // going through impl_invoke_with_func_ptr's template plumbing.  This lets
-  // the wire schema be exercised with arbitrary tag/value combinations.
+  // Send the wire-schema invoke payload directly (no template plumbing).
   int64_t raw_invoke(uintptr_t func_addr,
                      int32_t ret_tag,
                      std::vector<int32_t> tags,
@@ -105,19 +89,13 @@ TEST_CASE("sandbox lifecycle: create then destroy cleanly",
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
-  // After create, we should have a shared-memory base and size.
   CHECK(s.impl_get_memory_location() != nullptr);
   CHECK(s.impl_get_total_memory() == 64ull * 1024ull * 1024ull);
-
-  // TLS context should point at this sandbox.
   CHECK(rlbox::detail::thread_local_sandbox == &s);
-
-  // RPC channel should be live.
   CHECK(s.transport_alive());
 
   s.impl_destroy_sandbox();
 
-  // TLS pointer is cleared on destroy.
   CHECK(rlbox::detail::thread_local_sandbox == nullptr);
 }
 
@@ -130,9 +108,8 @@ TEST_CASE("sandbox malloc returns an address inside shared memory",
   auto addr = s.impl_malloc_in_sandbox(128);
   REQUIRE(addr != 0);
 
-  // With same-base mapping the returned sandbox pointer is an absolute
-  // address that also works on the host.  It must fall inside the mapped
-  // region, and host writes through it must be immediately visible.
+  // Same-base mapping: addr is a host-valid absolute address inside the
+  // mapped region; writes through it are visible to the child via MAP_SHARED.
   void* host_ptr = s.impl_get_unsandboxed_pointer<char>(addr);
   CHECK(s.impl_is_pointer_in_sandbox_memory(host_ptr));
 
@@ -163,8 +140,7 @@ TEST_CASE("sandbox malloc hands out distinct, non-overlapping regions",
     addrs.push_back(addr);
   }
 
-  // Every allocation must fit entirely within the shared region and must
-  // not overlap any other.
+  // Each allocation must fit in the shared region and not overlap any other.
   for (size_t i = 0; i < kN; ++i) {
     CHECK(addrs[i] >= base);
     CHECK(addrs[i] + kSize <= base + total);
@@ -187,7 +163,7 @@ TEST_CASE("sandbox malloc failure path: oversized allocation returns 0",
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
-  // Ask for more than the entire shared region — dlmalloc should refuse.
+  // Ask for more than the shared region; dlmalloc should refuse.
   auto off = s.impl_malloc_in_sandbox(s.impl_get_total_memory() * 2);
   CHECK(off == 0);
 
@@ -200,8 +176,8 @@ TEST_CASE("lookup_symbol resolves functions linked into the sandbox child",
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
-  // Call the shim's lookup_symbol handler directly.  Non-zero return means
-  // dlsym resolved the symbol inside the child process.
+  // Call the shim's lookup_symbol handler directly. Non-zero means dlsym
+  // resolved the symbol inside the child.
   auto encoded_ptr = s.raw_lookup_symbol("glue_add");
   CHECK(encoded_ptr != 0);
 
@@ -217,11 +193,9 @@ TEST_CASE("invoke executes a simple C function via libffi in the child",
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
-  // Resolve glue_add in the child.
   auto encoded = s.raw_lookup_symbol("glue_add");
   REQUIRE(encoded != 0);
 
-  // New typed schema: (func_offset, ret_tag, arg_tags, arg_values).
   std::vector<int32_t> arg_tags = { rlbox::ARG_SINT64, rlbox::ARG_SINT64 };
   std::vector<int64_t> arg_values = { 7, 35 };
   int64_t result =
@@ -237,21 +211,17 @@ TEST_CASE("invoke writes through a POINTER-tagged arg into shared memory",
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
-  // Allocate an int64 inside the sandbox and initialize to 0.
   auto addr = s.impl_malloc_in_sandbox(sizeof(int64_t));
   REQUIRE(addr != 0);
   auto* host_view = static_cast<int64_t*>(
     s.impl_get_unsandboxed_pointer<int64_t>(addr));
   *host_view = 0;
 
-  // Resolve glue_write_int64: int64_t(int64_t*, int64_t).
   auto encoded = s.raw_lookup_symbol("glue_write_int64");
   REQUIRE(encoded != 0);
 
-  // Send the pointer arg as an ARG_POINTER carrying an absolute address
-  // (same-base mapping makes host and child addresses identical for the
-  // shared region).  The callee writes through the pointer and the host
-  // sees the write immediately via MAP_SHARED.
+  // ARG_POINTER carries an absolute address; the callee writes through it
+  // and the host sees the result via MAP_SHARED.
   std::vector<int32_t> arg_tags = { rlbox::ARG_POINTER, rlbox::ARG_SINT64 };
   std::vector<int64_t> arg_values = { static_cast<int64_t>(addr),
                                       0xDEADBEEFLL };
@@ -268,8 +238,7 @@ TEST_CASE("invoke writes through a POINTER-tagged arg into shared memory",
 TEST_CASE("impl_invoke_with_func_ptr emits typed payload and round-trips",
           "[sandbox][invoke][typed]")
 {
-  // Exercise the high-level wrapper that derives the typed payload from
-  // the function type T.  This is the path rlbox itself uses.
+  // Exercise the high-level wrapper that derives the typed payload from T.
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
@@ -279,8 +248,6 @@ TEST_CASE("impl_invoke_with_func_ptr emits typed payload and round-trips",
   using Func_T = int64_t(int64_t, int64_t);
   auto* func_ptr = reinterpret_cast<Func_T*>(encoded);
 
-  // T is the original function type.  T_Converted is deduced from the
-  // func_ptr argument; T_Args are deduced from the call site.
   int64_t out = s.template impl_invoke_with_func_ptr<Func_T>(
     func_ptr, int64_t{ 100 }, int64_t{ 23 });
   CHECK(out == 123);
@@ -294,15 +261,13 @@ TEST_CASE("callback registration uses a trampoline slot and can unregister",
   IntegrationHarness s;
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
-  // Pick an arbitrary host-side key.
   void* key = reinterpret_cast<void*>(0xCAFEull);
   auto tramp = s.impl_register_callback<int64_t, int64_t>(key, key);
   CHECK(tramp != 0);
 
   s.impl_unregister_callback<int64_t, int64_t>(key);
 
-  // After unregister, a fresh registration should succeed again (slot
-  // returned to the pool).
+  // After unregister the slot returns to the pool, so re-registration works.
   auto tramp2 = s.impl_register_callback<int64_t, int64_t>(key, key);
   CHECK(tramp2 != 0);
   s.impl_unregister_callback<int64_t, int64_t>(key);
@@ -310,8 +275,7 @@ TEST_CASE("callback registration uses a trampoline slot and can unregister",
   s.impl_destroy_sandbox();
 }
 
-// Mirrors the shim's RLBOX_CALLBACK_SLOTS default — kept in sync manually
-// since the host doesn't know the shim's compile-time slot count.
+// Mirrors the shim's RLBOX_CALLBACK_SLOTS default. Kept in sync manually.
 static constexpr int kCallbackSlotsForTest = 64;
 
 TEST_CASE("callback pool fills exactly its slot count, then refuses more",
@@ -328,7 +292,7 @@ TEST_CASE("callback pool fills exactly its slot count, then refuses more",
     keys.push_back(k);
   }
 
-  // One past the pool size must fail (return 0) — pool is full.
+  // One past the pool size must fail (pool full).
   auto* overflow_key = reinterpret_cast<void*>(0x2000ull);
   auto overflow = s.impl_register_callback<int64_t, int64_t>(overflow_key,
                                                              overflow_key);

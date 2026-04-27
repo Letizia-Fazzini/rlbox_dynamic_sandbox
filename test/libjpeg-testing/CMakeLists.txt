@@ -159,7 +159,7 @@ file(WRITE ${JPEG_WASM_CONFIG_DIR}/jversion.h
 
 # Stub setjmp.h: shadows the WASI sysroot header whose #error blocks WASM builds.
 # setjmp() always returns 0; longjmp() traps (lowers to WASM unreachable).
-# Safe for PoC use with valid inputs — error recovery simply kills the sandbox.
+# Safe for PoC use with valid inputs -- error recovery simply kills the sandbox.
 file(WRITE ${JPEG_WASM_CONFIG_DIR}/setjmp.h
 "/* stub setjmp.h -- WASM PoC: setjmp always succeeds, longjmp traps */\n\
 #ifndef _SETJMP_H\n\

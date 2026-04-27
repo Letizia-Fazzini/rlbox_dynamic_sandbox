@@ -106,7 +106,7 @@ def prepare_input(build_dir: Path, source_bytes: bytes, size: int, library: Libr
     target = build_dir / "test_data" / "test_data1.txt"
     target.parent.mkdir(parents=True, exist_ok=True)
     if not source_bytes:
-        raise RuntimeError("empty source bytes — can't repeat to target size")
+        raise RuntimeError("empty source bytes -- can't repeat to target size")
 
     nl = source_bytes.find(b"\n")
     if nl == -1:
@@ -307,7 +307,7 @@ def main() -> int:
         if seed_dir is None:
             seed_dir = process_builds[0][1]
     if seed_dir is None:
-        print("[bench] nothing to do — all backends disabled", file=sys.stderr)
+        print("[bench] nothing to do -- all backends disabled", file=sys.stderr)
         return 1
 
     bench_native = ensure_bench_native(wasm2c_build_dir)
@@ -355,7 +355,7 @@ def main() -> int:
                     )
                     all_rows.extend(rows)
 
-                # Native reference — runs from whichever dir we picked for
+                # Native reference -- runs from whichever dir we picked for
                 # seeding (test_data.txt is identical across them).
                 rows = run_config(
                     "native",
