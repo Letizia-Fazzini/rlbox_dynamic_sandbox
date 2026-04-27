@@ -6,9 +6,11 @@
 // allocation backend pinning (via an owner registry that overrides the
 // policy when a pointer-typed arg is owned by a backend other than the
 // one the policy picked).  M5 makes wasm-side allocations actually work
-// by encoding the owning backend in bit 63 of T_PointerType — process
-// VAs on x86_64 never set bit 63 in user space, and wasm offsets are
-// 32-bit, so the top bit is free on both sides.  impl_malloc_in_sandbox
+// by encoding the owning backend in the *high* bit of T_PointerType
+// (bit 31 on i386 hosts, bit 63 on x86_64 hosts) — canonical user-space
+// VAs never set the high bit on either ABI, and wasm offsets are 32-bit
+// (and on i386 always sub-2GB in practice), so the top bit is free on
+// both sides.  impl_malloc_in_sandbox
 // now consults the policy (with func_name == nullptr signaling an
 // allocation context) to decide which backend to allocate from; wasm
 // allocations are widened to uintptr_t and OR'd with the tag bit on the
@@ -87,6 +89,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -293,17 +296,23 @@ public:
   using T_PointerType = rlbox_process_sandbox::T_PointerType;
   using T_ShortType = rlbox_process_sandbox::T_ShortType;
 
-  // Bit 63 encodes the owning backend of a T_PointerType: 0 for process
-  // (natural — x86_64 canonical user VAs never set bit 63), 1 for wasm
-  // (wasm2c offsets are 32-bit, so bit 63 is unused).  Kept in the value
-  // itself rather than a side table so pointer values that survive
-  // through arithmetic, struct fields, or libffi ABI remain
-  // self-identifying.  A consequence: process-side allocations returned
-  // from process_sbx.impl_malloc_in_sandbox must NEVER set bit 63 (true
-  // in practice on x86_64 user space — if that ever changes we'd need to
-  // squeeze the tag into a different bit or use a side table).
+  // The high bit of T_PointerType encodes the owning backend: 0 for
+  // process (natural — canonical user-space VAs never set the high bit
+  // on i386 or x86_64), 1 for wasm (wasm2c offsets are 32-bit and well
+  // under 2 GiB in practice, so the top bit is unused on both 32- and
+  // 64-bit hosts).  Kept in the value itself rather than a side table so
+  // pointer values that survive through arithmetic, struct fields, or
+  // libffi ABI remain self-identifying.  A consequence: process-side
+  // allocations returned from process_sbx.impl_malloc_in_sandbox must
+  // NEVER set the high bit — if that ever changes we'd need a different
+  // bit or a side table.
+  //
+  // We compute the bit position from sizeof(T_PointerType) so the same
+  // source compiles correctly on 32-bit hosts (bit 31) and 64-bit hosts
+  // (bit 63) without an #ifdef.
   static constexpr T_PointerType META_TAG_WASM =
-    static_cast<T_PointerType>(1) << 63;
+    static_cast<T_PointerType>(1)
+      << (sizeof(T_PointerType) * CHAR_BIT - 1);
   static constexpr T_PointerType META_TAG_MASK = META_TAG_WASM;
 
   static constexpr meta_backend tag_owner(T_PointerType p) noexcept
@@ -408,8 +417,9 @@ protected:
   // cleared on impl_free_in_sandbox.  impl_invoke_with_func_ptr consults
   // this to override the policy when pointer args are owned by a backend
   // other than the policy's pick.  Keys are the full tagged T_PointerType
-  // values — process VAs with bit 63 clear, wasm offsets widened and
-  // OR'd with META_TAG_WASM — so the two address spaces can't collide.
+  // values — process VAs with the high bit clear (bit 31 on i386, bit 63
+  // on x86_64), wasm offsets widened and OR'd with META_TAG_WASM — so the
+  // two address spaces can't collide.
   std::mutex alloc_mutex;
   std::unordered_map<T_PointerType, meta_backend> alloc_owner;
 
@@ -1139,8 +1149,11 @@ public:
         return 0;
       }
       // Sanity: process backend must not hand back a pointer that
-      // collides with the wasm tag bit.  On x86_64 user space this
-      // should be impossible; assert to catch the day it stops being.
+      // collides with the wasm tag bit.  T_PointerType from the process
+      // backend is an offset into the shared-memory region (not a raw
+      // VA), so this only fires if that region grows past 2 GiB on
+      // 32-bit hosts or 8 EiB on 64-bit hosts; assert to catch the day
+      // it stops being safe.
       if (p & META_TAG_MASK) {
         fputs("rlbox_meta_sandbox: process allocation collided with tag bit\n",
               stderr);

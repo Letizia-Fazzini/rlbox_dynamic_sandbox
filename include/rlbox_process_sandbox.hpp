@@ -53,8 +53,8 @@ namespace rlbox {
 class rlbox_process_sandbox
 {
 public:
-  // The child is a native Linux x86_64 process sharing the host ABI, so
-  // the integer widths mirror the host.  T_PointerType stays as an
+  // The child is a native Linux process sharing the host ABI (x86_64 or
+  // i386), so the integer widths mirror the host.  T_PointerType stays as an
   // unsigned integer because rlbox's tainted<T*> is serialized as a
   // sandbox offset on the wire (offset = host_addr - shared_memory_base).
   using T_LongLongType = int64_t;
@@ -309,8 +309,17 @@ public:
     ftruncate(shm_fd, shared_memory_size);
 
     // 2. Map it in the host
-    // Use aligned mapping to simplify pointer translation and sandbox lookup
-    size_t alignment = 0x100000000ull; // 4GB alignment
+    // Use aligned mapping to simplify pointer translation and sandbox lookup.
+    // In 64-bit, align to 4 GB so the upper 32 bits of any sandboxed pointer
+    // are a constant (enabling fast base recovery via masking).  In 32-bit the
+    // entire address space is only 4 GB so that alignment is impossible;
+    // ordinary page alignment is sufficient because offsets are just
+    // (ptr - base) and always fit in uintptr_t.
+#if UINTPTR_MAX > 0xFFFFFFFFull
+    size_t alignment = 0x100000000ull; // 4 GB alignment (64-bit only)
+#else
+    size_t alignment = 0x1000; // page alignment (32-bit)
+#endif
     void* aligned_addr = os_mmap_aligned(shared_memory_size, alignment);
     if (!aligned_addr) {
       close(shm_fd);

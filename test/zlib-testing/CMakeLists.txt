@@ -12,6 +12,13 @@ project(rlbox_wasm_example
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Force i386 native build so host pointers match wasm2c's 32-bit offsets.
+# Must come before find_package / FetchContent so deps inherit -m32.
+# See top-level CMakeLists.txt for the full rationale.
+add_compile_options(-m32)
+add_link_options(-m32)
+message(STATUS "zlib-testing: forcing 32-bit (i386) build via -m32")
+
 find_package(ZLIB REQUIRED)
 
 include(FetchContent)

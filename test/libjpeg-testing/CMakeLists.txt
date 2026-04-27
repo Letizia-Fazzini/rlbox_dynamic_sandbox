@@ -12,7 +12,25 @@ project(rlbox_wasm_example
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Force i386 native build so host pointers match wasm2c's 32-bit offsets.
+# Must come before find_package / FetchContent so deps inherit -m32.
+# See top-level CMakeLists.txt for the full rationale.
+add_compile_options(-m32)
+add_link_options(-m32)
+message(STATUS "libjpeg-testing: forcing 32-bit (i386) build via -m32")
+
+# We force -m32 above, so steer find_package(JPEG) toward the i386 multiarch
+# libdir instead of the default x86_64 one. Without this, CMake happily
+# resolves /usr/lib/x86_64-linux-gnu/libjpeg.so and the linker then errors
+# with "file in wrong format" when mixing it with our 32-bit objects.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT DEFINED JPEG_LIBRARY)
+  set(CMAKE_LIBRARY_ARCHITECTURE "i386-linux-gnu")
+  list(PREPEND CMAKE_PREFIX_PATH "/usr/lib/i386-linux-gnu")
+  set(CMAKE_FIND_ROOT_PATH "/usr/lib/i386-linux-gnu")
+endif()
+
 find_package(JPEG REQUIRED)
+message(STATUS "libjpeg-testing: using JPEG_LIBRARIES=${JPEG_LIBRARIES}")
 
 include(FetchContent)
 

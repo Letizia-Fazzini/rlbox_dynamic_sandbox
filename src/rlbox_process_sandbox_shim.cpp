@@ -120,8 +120,8 @@ static constexpr size_t k_callback_slots = RLBOX_CALLBACK_SLOTS;
 // The slot array lives in the shared mspace so that pre-forked workers
 // (which inherit the *pointer* at fork time) read up-to-date keys via
 // shared memory, not their own private snapshot. atomic<uintptr_t> is
-// lock-free and standard-layout on x86_64; placement-new initializes
-// each slot to 0.
+// lock-free and standard-layout on the supported host ABIs (x86_64 and
+// i386); placement-new initializes each slot to 0.
 static std::atomic<uintptr_t>* g_callback_keys = nullptr;
 
 static void init_shared_callback_keys()
