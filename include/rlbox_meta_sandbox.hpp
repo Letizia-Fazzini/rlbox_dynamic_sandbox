@@ -285,11 +285,43 @@ inline meta_policy_fn make_adaptive_policy(size_t alloc_warmup = 1,
 template<typename F> struct meta_fn_ret;
 template<typename R, typename... A> struct meta_fn_ret<R(A...)> { using type = R; };
 
+// Re-derive the rlbox-converted function-pointer type for the wasm
+// backend specifically.  rlbox normally hands the meta a T_Converted
+// computed for T_Sbx = rlbox_meta_sandbox, which (because meta inherits
+// process's T_*Type widths, including T_LongType=int64_t) does not
+// match the wasm ABI when the meta forwards to the wasm backend.  In
+// particular wasm2c casts the function pointer to T_Converted's
+// signature and reads the return register as that width, so a
+// `unsigned long`-returning thunk (uint32_t under wasm's LP32 model)
+// invoked through a uint64_t-returning T_Converted picks up garbage
+// in the upper 32 bits — which then trips rlbox's outer overflow
+// dynamic_check on the way back to the application.
+//
+// Use rlbox's own helper (the same one rlbox uses to build T_Converted
+// in the first place) but specialise on rlbox_wasm2c_sandbox so each
+// arg / return type is mapped through wasm's T_*Type widths instead of
+// process's.  Result: the func_ptr cast inside wasm2c matches the
+// real wasm ABI, the return value is read at its true width, and the
+// meta then widens it back to the meta-converted type at the boundary
+// so rlbox's outer return-conversion sees what it expects.
+template<typename F>
+using meta_wasm_converted_fn_t = std::remove_pointer_t<decltype(
+  ::rlbox::convert_fn_ptr_to_sandbox_equivalent_detail::helper<
+    rlbox_wasm2c_sandbox>(std::declval<F*>()))>;
+
 class rlbox_meta_sandbox
 {
 public:
-  // Integer widths follow the process backend (host-native 64-bit).  Wasm
-  // dispatch narrows at the boundary in wasm_sbx.impl_invoke_with_func_ptr.
+  // Integer widths follow the process backend (host-native, so
+  // T_LongType=int64_t).  This is what rlbox uses to compute the
+  // T_Converted it hands to impl_invoke_with_func_ptr.  Wasm uses
+  // narrower widths (T_LongType=int32_t under its LP32 model), so
+  // the wasm-dispatch path inside impl_invoke_with_func_ptr re-derives
+  // a wasm-specific T_Converted via meta_wasm_converted_fn_t<T>
+  // before forwarding — otherwise wasm2c would cast its function
+  // pointer to a signature with the meta's wider return type and
+  // read garbage in the upper bits of the return register (see the
+  // long comment on meta_wasm_converted_fn_t for details).
   using T_LongLongType = rlbox_process_sandbox::T_LongLongType;
   using T_LongType = rlbox_process_sandbox::T_LongType;
   using T_IntType = rlbox_process_sandbox::T_IntType;
@@ -496,7 +528,7 @@ protected:
   // zlib (adaptive converges within ~6 invokes per symbol; 16 gives
   // enough slack that bursty ownership-override flips don't toggle the
   // pin off-and-on without ever sticking).
-  uint32_t pin_threshold_ = 16;
+  uint32_t pin_threshold_ = 0;
 
 public:
   rlbox_meta_sandbox()
@@ -591,23 +623,56 @@ public:
       return wasm_sbx.impl_get_unsandboxed_pointer<T>(
         static_cast<rlbox_wasm2c_sandbox::T_PointerType>(tag_strip(p)));
     }
+    // Untagged values fall into two cases on the read-back path:
+    //   (a) a process-backend pointer, or
+    //   (b) a wasm offset whose tag was stripped before being stored
+    //       into a sandbox memory slot via impl_get_sandboxed_pointer
+    //       (see the comment there for why the strip is mandatory on
+    //       the wasm-store path).
+    // Without a probe we'd default-route to process, which on case (b)
+    // hands back a bogus VA that segfaults the next deref (observed
+    // when copy_and_verify_range walks *outBuffer for a wasm-allocated
+    // output buffer).  Disambiguate by asking the wasm backend whether
+    // p is a valid offset into its linear memory; if so, route there.
+    // Process T_PointerType values returned from
+    // process_sbx.impl_get_sandboxed_pointer are host VAs in the
+    // shared-memory mapping (e.g. 0x40007000-ish on i386), well above
+    // any reasonable wasm linear-memory size, so the disambiguation is
+    // unambiguous in practice on both i386 and x86_64.
+    auto& ws = const_cast<rlbox_wasm2c_sandbox&>(wasm_sbx);
+    if (static_cast<size_t>(p) < ws.impl_get_total_memory()) {
+      return wasm_sbx.impl_get_unsandboxed_pointer<T>(
+        static_cast<rlbox_wasm2c_sandbox::T_PointerType>(p));
+    }
     return process_sbx.impl_get_unsandboxed_pointer<T>(p);
   }
 
   template<typename T>
   inline T_PointerType impl_get_sandboxed_pointer(const void* p) const
   {
-    // Host VA → tagged T_PointerType.  tainted<T*> stores the host VA;
-    // RLBox converts back to T_PointerType through this hook at the
-    // invoke boundary.  If the VA lies inside wasm's linear memory,
-    // translate via wasm_sbx and tag; otherwise fall back to process.
+    // Host VA → backend-native T_PointerType.  rlbox uses this hook to
+    // produce the value that gets *stored into pointer slots inside
+    // sandbox memory* and *passed across the invoke boundary*.  In both
+    // cases the consumer is the backend itself, which expects its own
+    // native pointer representation — no META_TAG_WASM bit.  If we
+    // returned the tagged form, narrowing it into a wasm slot (`*outBuf =
+    // sandboxPtr`) would store a >2 GiB offset that traps OOB on the
+    // next wasm-side dereference (observed as WASM_RT_TRAP_OOB inside
+    // tjCompress2's first store to the destination buffer).
+    //
+    // Ownership tracking still works: alloc_owner is keyed by the
+    // tagged form returned from impl_malloc_in_sandbox, and owner_of
+    // accepts either tagged or untagged keys so the override path
+    // matches regardless of whether the pointer came back via this
+    // hook (untagged) or directly from a meta malloc (tagged).
+    //
     // const_cast because wasm_sbx's membership check is non-const
     // upstream even though it reads values that don't change after
     // impl_create_sandbox.
     auto& ws = const_cast<rlbox_wasm2c_sandbox&>(wasm_sbx);
     if (ws.impl_is_pointer_in_sandbox_memory(p)) {
       auto raw = wasm_sbx.impl_get_sandboxed_pointer<T>(p);
-      return tag_wasm(static_cast<T_PointerType>(raw));
+      return static_cast<T_PointerType>(raw);
     }
     return process_sbx.impl_get_sandboxed_pointer<T>(p);
   }
@@ -770,6 +835,7 @@ public:
   {
     auto* rec = reinterpret_cast<meta_symbol_record*>(func_ptr);
 
+    /*
     // Fast path: once a symbol has pinned to a backend, skip policy
     // context build, policy call, ownership-override fold, and the
     // sample-push RAII (no clock_gettime, no stats_mutex grab, no ring
@@ -870,6 +936,7 @@ public:
           std::forward<T_Args>(params)...);
       }
     }
+      */
 
     // Slow path: full policy consultation, ownership override, timing.
     // After enough consecutive dispatches to the same backend, the
@@ -919,13 +986,28 @@ public:
     };
     (inspect(std::forward<T_Args>(params)), ...);
 
+    // DEBUG: log every slow-path dispatch decision so we can see what
+    // backend each invoke landed on and whether the ownership-override
+    // fired.  policy_pick is the raw policy choice; final_choice is
+    // after the override.
+    meta_backend policy_pick = choice;
     if (saw_process_ptr && saw_wasm_ptr) {
+      fprintf(stderr,
+              "[META] sym=%s ABORT span-both-backends policy_pick=%d\n",
+              rec->name.c_str(), (int)policy_pick);
+      fflush(stderr);
       fputs("rlbox_meta_sandbox: invoke args span both backends' allocations\n",
             stderr);
       std::abort();
     }
     if (saw_process_ptr) choice = meta_backend::process;
     else if (saw_wasm_ptr) choice = meta_backend::wasm;
+    fprintf(stderr,
+            "[META] sym=%s policy_pick=%d saw_proc=%d saw_wasm=%d "
+            "final=%d\n",
+            rec->name.c_str(), (int)policy_pick,
+            saw_process_ptr, saw_wasm_ptr, (int)choice);
+    fflush(stderr);
 
     // RAII sample pusher: times the forwarded call and records the
     // result against the chosen backend when the scope exits.  Works
@@ -1015,7 +1097,14 @@ public:
               return static_cast<A>(it->second.wasm_slot);
             }
           }
-          return val;
+          // Strip the wasm-owner tag bit before forwarding to wasm.
+          // On x86_64 the uintptr_t→uint32_t narrowing at the wasm
+          // invoke boundary clears bit 63 for free, but on i386 hosts
+          // T_PointerType is already uint32_t and META_TAG_WASM is bit
+          // 31, so the narrow is the identity and the tag would land
+          // in wasm as a >2GiB offset → OOB trap.  Explicit strip is
+          // ABI-safe on both.
+          return static_cast<A>(tag_strip(val));
         } else {
           return static_cast<A>(std::forward<decltype(a)>(a));
         }
@@ -1049,21 +1138,57 @@ public:
       sample_pusher sp{ rec, meta_backend::wasm, monotonic_ms(),
                         pin_threshold_ };
       cleanup_runner cr{ &struct_cleanups };
+      // Wasm-ABI re-typing of the function pointer.  See
+      // meta_wasm_converted_fn_t comment for the why; in short, the
+      // T_Converted rlbox handed us is computed against the meta's
+      // (=process's) T_*Type widths and would cause wasm2c to read
+      // returns / pass args at the wrong width.  T_Converted_Wasm is
+      // the same function type but with each T_*Type taken from
+      // rlbox_wasm2c_sandbox, so the func_ptr cast inside wasm2c
+      // matches the actual wasm thunk's signature.
+      using T_Converted_Wasm = meta_wasm_converted_fn_t<T>;
       using T_Ret_wasm = typename meta_fn_ret<T>::type;
       if constexpr (std::is_pointer_v<T_Ret_wasm>) {
-        auto raw = wasm_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
-          reinterpret_cast<T_Converted*>(rec->wasm_sym),
+        auto raw = wasm_sbx.template impl_invoke_with_func_ptr<T, T_Converted_Wasm>(
+          reinterpret_cast<T_Converted_Wasm*>(rec->wasm_sym),
           translate(std::forward<T_Args>(params))...);
         if (raw != 0) {
           T_PointerType tagged = tag_wasm(static_cast<T_PointerType>(raw));
-          { std::lock_guard<std::mutex> g(alloc_mutex); alloc_owner.emplace(tagged, meta_backend::wasm); }
+          {
+            std::lock_guard<std::mutex> g(alloc_mutex);
+            alloc_owner.emplace(tagged, meta_backend::wasm);
+            // DEBUG: mirror of the process-branch [META-REG] line so
+            // we can see when a pointer-returning invoke (e.g.
+            // tjInitCompress) registers its handle on the wasm side.
+            fprintf(stderr,
+                    "[META-REG] sym=%s backend=wasm result=0x%llx "
+                    "registry_size=%zu\n",
+                    rec->name.c_str(),
+                    (unsigned long long)tagged,
+                    alloc_owner.size());
+            fflush(stderr);
+          }
           return tagged;
         }
         return static_cast<T_PointerType>(0);
       } else {
-        return wasm_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
-          reinterpret_cast<T_Converted*>(rec->wasm_sym),
-          translate(std::forward<T_Args>(params))...);
+        // Cast to T_Converted's return type so this branch and the
+        // process branch (below) deduce the same `auto` return type for
+        // impl_invoke_with_func_ptr.  wasm_sbx returns T_Converted_Wasm's
+        // return type (e.g. uint32_t for `unsigned long` under wasm's
+        // LP32 model), while process_sbx returns T_Converted's return
+        // type (e.g. uint64_t for `unsigned long` under the meta's
+        // process-inherited widths); without a cast the two return
+        // statements would disagree and gcc rejects the function with
+        // "inconsistent deduction for auto return type".  This same
+        // widening is also what restores the bit-width rlbox's outer
+        // return-conversion machinery is expecting on the way back to
+        // the application.
+        using T_Ret_conv = typename meta_fn_ret<T_Converted>::type;
+        return static_cast<T_Ret_conv>(
+          wasm_sbx.template impl_invoke_with_func_ptr<T, T_Converted_Wasm>(
+            reinterpret_cast<T_Converted_Wasm*>(rec->wasm_sym),
+            translate(std::forward<T_Args>(params))...));
       }
     }
 
@@ -1078,12 +1203,27 @@ public:
       if (result != 0) {
         std::lock_guard<std::mutex> g(alloc_mutex);
         alloc_owner.emplace(result, meta_backend::process);
+        // DEBUG: confirm pointer-returning invokes (e.g. tjInitCompress)
+        // actually register their result in alloc_owner so subsequent
+        // invokes' ownership-override path can see them.
+        fprintf(stderr,
+                "[META-REG] sym=%s backend=process result=0x%llx "
+                "registry_size=%zu\n",
+                rec->name.c_str(),
+                (unsigned long long)result,
+                alloc_owner.size());
+        fflush(stderr);
       }
       return result;
     } else {
-      return process_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
-        reinterpret_cast<T_Converted*>(rec->process_sym),
-        std::forward<T_Args>(params)...);
+      // See the matching cast on the wasm branch above for why this
+      // explicit conversion is required to keep `auto` return-type
+      // deduction consistent across both backends.
+      using T_Ret_conv = typename meta_fn_ret<T_Converted>::type;
+      return static_cast<T_Ret_conv>(
+        process_sbx.impl_invoke_with_func_ptr<T, T_Converted>(
+          reinterpret_cast<T_Converted*>(rec->process_sym),
+          std::forward<T_Args>(params)...));
     }
   }
 
@@ -1166,6 +1306,15 @@ public:
       std::lock_guard<std::mutex> g(alloc_mutex);
       alloc_owner[p] = choice;
     }
+    // DEBUG: log every meta-level malloc so the dispatch trace shows
+    // which backend each sandbox buffer (sandboxSrc, outBuffer,\n    // outSize, ...) was allocated on.
+    fprintf(stderr,
+            "[META-MALLOC] size=%zu backend=%s ptr=0x%llx registry_size=%zu\n",
+            size,
+            choice == meta_backend::wasm ? "wasm" : "process",
+            (unsigned long long)p,
+            alloc_owner.size());
+    fflush(stderr);
     // If this matches a registered struct type, co-allocate a stable
     // wasm scratch and record the translator with the allocation.
     // alloc_mutex is released before the wasm alloc runs so we don't
@@ -1218,13 +1367,42 @@ public:
     if (p == 0) {
       return;
     }
-    meta_backend owner = tag_owner(p);
-    T_PointerType raw = tag_strip(p);
+    // Source of truth for ownership is alloc_owner, NOT the tag bit.
+    // Wasm pointers can reach us untagged: impl_get_sandboxed_pointer
+    // strips META_TAG_WASM so the value is safe to store in a wasm
+    // slot (see comment there), and rlbox roundtrips tainted pointers
+    // through that hook on several free paths.  If we keyed off the
+    // tag alone, an untagged-but-wasm pointer would route to the
+    // process backend, which would call free() on a foreign offset
+    // and abort dlmalloc inside the sandbox child.  Look the pointer
+    // up in both forms and only fall back to the tag bit when the
+    // registry has no entry (interior / externally-derived pointers).
+    T_PointerType registry_key = p;
+    meta_backend owner;
+    {
+      std::lock_guard<std::mutex> g(alloc_mutex);
+      auto it = alloc_owner.find(p);
+      if (it == alloc_owner.end() && (p & META_TAG_MASK) == 0) {
+        auto it2 = alloc_owner.find(tag_wasm(p));
+        if (it2 != alloc_owner.end()) {
+          registry_key = tag_wasm(p);
+          owner = it2->second;
+          alloc_owner.erase(it2);
+        } else {
+          owner = tag_owner(p);
+        }
+      } else if (it != alloc_owner.end()) {
+        owner = it->second;
+        alloc_owner.erase(it);
+      } else {
+        owner = tag_owner(p);
+      }
+    }
+    T_PointerType raw = tag_strip(registry_key);
     uint32_t scratch_to_free = 0;
     {
       std::lock_guard<std::mutex> g(alloc_mutex);
-      alloc_owner.erase(p);
-      auto sit = struct_allocs.find(p);
+      auto sit = struct_allocs.find(registry_key);
       if (sit != struct_allocs.end()) {
         scratch_to_free = sit->second.wasm_scratch;
         struct_allocs.erase(sit);
@@ -1253,10 +1431,20 @@ public:
   {
     std::lock_guard<std::mutex> g(alloc_mutex);
     auto it = alloc_owner.find(p);
-    if (it == alloc_owner.end()) {
-      return { false, meta_backend::process };
+    if (it != alloc_owner.end()) {
+      return { true, it->second };
     }
-    return { true, it->second };
+    // Untagged wasm offsets reach us via impl_get_sandboxed_pointer
+    // (which deliberately strips the tag so the value is safe to store
+    // in wasm slots).  Try the tagged form so ownership-override still
+    // fires for those.  No-op when p already has the tag bit.
+    if ((p & META_TAG_MASK) == 0) {
+      auto it2 = alloc_owner.find(tag_wasm(p));
+      if (it2 != alloc_owner.end()) {
+        return { true, it2->second };
+      }
+    }
+    return { false, meta_backend::process };
   }
 
   // Dispatch counters — useful for tests that want to assert routing

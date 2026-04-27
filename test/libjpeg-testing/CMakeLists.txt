@@ -309,6 +309,19 @@ add_custom_command(OUTPUT "${JPEG_H}" "${JPEG_C}" "${JPEG_WASM}"
                            -O3
                            -DC_LOSSLESS_SUPPORTED -DD_LOSSLESS_SUPPORTED
                            -Wl,--export-all -Wl,--no-entry -Wl,--growable-table -Wl,--stack-first -Wl,-z,stack-size=1048576 -Wl,--export-table
+                           # Pin wasm linear memory at exactly 64 MiB (1024 pages of 64 KiB),
+                           # initial == max, so memory.grow is never invoked.
+                           #
+                           # Why initial == max: with WASM_RT_USE_MMAP=0 the runtime backs
+                           # the heap with calloc(), and wasm_rt_grow_memory is implemented
+                           # as realloc().  realloc almost always *moves* the buffer for
+                           # multi-MiB growths, which silently invalidates any host pointer
+                           # the wasm2c/RLBox glue has already computed for a tainted_volatile
+                           # — manifesting as a SIGSEGV on what looks like a perfectly valid
+                           # sandbox index a few accesses after the grow.  Pre-allocating the
+                           # full 64 MiB up front (a fine cost on a 32-bit process) avoids
+                           # the realloc entirely.
+                           -Wl,--initial-memory=67108864 -Wl,--max-memory=67108864
                            -I${jpeg_wasm_SOURCE_DIR}
                            -I${JPEG_WASM_CONFIG_DIR}
                            -o ${JPEG_WASM}
@@ -335,7 +348,11 @@ target_include_directories(jpeg_sandboxed PUBLIC ${wasm2c_compiler_SOURCE_DIR}/w
                                  PUBLIC ${jpeg_wasm_SOURCE_DIR}
                                  PUBLIC ${JPEG_WASM_CONFIG_DIR})
 
-target_compile_definitions(jpeg_sandboxed PUBLIC WASM_RT_USE_MMAP=1
+# WASM_RT_USE_MMAP=1 requires reserving 4-8 GiB of contiguous virtual address
+# space, which is impossible in a 32-bit process (size_t is only 4 bytes, so
+# the reservation size silently truncates to 0 and mmap fails with EINVAL).
+# Since this project forces -m32, always disable mmap and fall back to calloc.
+target_compile_definitions(jpeg_sandboxed PUBLIC WASM_RT_USE_MMAP=0
                                  PUBLIC WASM_RT_SKIP_SIGNAL_RECOVERY=1
                                  PUBLIC WASM_RT_NONCONFORMING_UNCHECKED_STACK_EXHAUSTION=1)
 

@@ -264,7 +264,7 @@ def main() -> int:
     ap.add_argument("--num-datasets", type=int, default=None,
                     help="number of datasets passed to each binary as the second "
                          "positional arg (default: len(sizes)).  Must not exceed len(sizes).")
-    ap.add_argument("--inner-iters", type=int, default=1,
+    ap.add_argument("--inner-iters", type=int, default=10,
                     help="inner iterations per dataset inside the binary, passed as "
                          "the third positional arg (default: 1)")
     ap.add_argument("--out", type=Path, default=BENCH_DIR / "results.csv")

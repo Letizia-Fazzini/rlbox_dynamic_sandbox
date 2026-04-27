@@ -181,8 +181,19 @@ protected:
       capnp::writeMessageToFd(request_fd, out_msg);
       capnp::StreamFdMessageReader in_msg(request_fd);
       return in_msg.getRoot<wire::Response>().getResult();
-    } catch (const kj::Exception&) {
+    } catch (const kj::Exception& e) {
+      fprintf(stderr, "[capnp_call] kj::Exception: %s\n", e.getDescription().cStr());
+      fflush(stderr);
       return 0;
+    } catch (const std::exception& e) {
+      // Fallback: in 32-bit builds kj::ExceptionImpl may not match
+      // catch(kj::Exception&) due to RTTI/visibility differences between DSOs.
+      fprintf(stderr, "[capnp_call] std::exception: %s\n", e.what());
+      fflush(stderr);
+      return 0;
+    } catch (...) {
+      fprintf(stderr, "[capnp_call] unknown exception\n");
+      fflush(stderr);
     }
   }
 
@@ -317,10 +328,40 @@ public:
     // (ptr - base) and always fit in uintptr_t.
 #if UINTPTR_MAX > 0xFFFFFFFFull
     size_t alignment = 0x100000000ull; // 4 GB alignment (64-bit only)
-#else
-    size_t alignment = 0x1000; // page alignment (32-bit)
-#endif
     void* aligned_addr = os_mmap_aligned(shared_memory_size, alignment);
+#else
+    // 32-bit: the address must be reproducible across fork+exec (the child
+    // re-maps the same memfd at the same virtual address via
+    // MAP_FIXED_NOREPLACE).  If we let the kernel pick freely, it tends to
+    // hand us a high address (~0xf7xxxxxx) that collides with the freshly-
+    // exec'd child's library mappings, so MAP_FIXED_NOREPLACE in the shim
+    // fails silently.
+    //
+    // The 0x40000000-0x80000000 range is reliably free in default 32-bit
+    // Linux process layouts (mmap zone descends from ~0xf7000000; brk
+    // ascends from ~0x08048000; libraries never land in the middle gap).
+    // Try a few hint addresses in that gap until one works for the host.
+    void* aligned_addr = nullptr;
+    static const uintptr_t k_hint_addrs[] = {
+      0x40000000u, 0x50000000u, 0x60000000u, 0x70000000u
+    };
+    for (uintptr_t hint : k_hint_addrs) {
+      void* res = mmap(reinterpret_cast<void*>(hint),
+                       shared_memory_size,
+                       PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                       -1,
+                       0);
+      if (res != MAP_FAILED &&
+          reinterpret_cast<uintptr_t>(res) == hint) {
+        aligned_addr = res;
+        break;
+      }
+      if (res != MAP_FAILED) {
+        munmap(res, shared_memory_size); // kernel ignored our hint
+      }
+    }
+#endif
     if (!aligned_addr) {
       close(shm_fd);
       return false;

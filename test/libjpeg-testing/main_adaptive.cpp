@@ -70,6 +70,24 @@ int main(int argc, char const *argv[]) {
       int row_stride = image_width * image_channels;
       fprintf(stderr, "[DBG] d=%d it=%d step=2: image %dx%dx%d, row_stride=%d\n", d, it, image_width, image_height, image_channels, row_stride); fflush(stderr);
 
+      //set up output buffer pointers inside sandbox.  We pre-allocate the
+      //JPEG output buffer ourselves (so it goes through meta's
+      //malloc_in_sandbox and is therefore tagged in alloc_owner) and pass
+      //TJFLAG_NOREALLOC so libjpeg-turbo won't replace it with an internal
+      //tjAlloc'd (untagged) buffer that copy_and_verify_range can't translate.
+      auto maxSize = sandbox.invoke_sandbox_function(tjBufSize, image_width, image_height, TJSAMP_444);
+      auto verifiedMaxSize = maxSize.copy_and_verify([](unsigned long ret) {
+        release_assert(ret != 0, "max size cannot be 0");
+        return ret;
+      });
+      auto sandboxOut = sandbox.malloc_in_sandbox<unsigned char>(verifiedMaxSize);
+
+      auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
+      *outBuffer = sandboxOut;
+      auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
+      *outSize = verifiedMaxSize;
+      fprintf(stderr, "[DBG]  d=%d it=%d step=5: outBuffer/outSize allocated (maxSize=%lu)\n", d, it, verifiedMaxSize); fflush(stderr);
+      
       auto sandboxSrc = sandbox.malloc_in_sandbox<unsigned char>(image_height * row_stride);
       fprintf(stderr, "[DBG] d=%d it=%d step=3: sandboxSrc allocated\n", d, it); fflush(stderr);
       for (int i = 0; i < image_height * row_stride; i++) {
@@ -87,12 +105,7 @@ int main(int argc, char const *argv[]) {
         exit(1);
       }
 
-      //set up output buffer pointers inside sandbox
-      auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
-      *outBuffer = nullptr;
-      auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
-      *outSize = 0;
-      fprintf(stderr, "[DBG] d=%d it=%d step=5: outBuffer/outSize allocated\n", d, it); fflush(stderr);
+      
 
       double t_start = monotonic_ms();
       fprintf(stderr, "[DBG] d=%d it=%d step=6: calling tjInitCompress\n", d, it); fflush(stderr);
@@ -112,7 +125,7 @@ int main(int argc, char const *argv[]) {
         outSize,
         TJSAMP_444,
         quality,
-        0
+        TJFLAG_NOREALLOC
       );
       fprintf(stderr, "[DBG] d=%d it=%d step=9: tjCompress2 returned\n", d, it); fflush(stderr);
       compress_ret.copy_and_verify([](int ret) {
@@ -149,8 +162,8 @@ int main(int argc, char const *argv[]) {
       fclose(destinationFile);
       fprintf(stderr, "[DBG] d=%d it=%d step=17: fwrite done, freeing sandbox buffers\n", d, it); fflush(stderr);
 
-      sandbox.free_in_sandbox(*outBuffer);
-      fprintf(stderr, "[DBG] d=%d it=%d step=18: *outBuffer freed\n", d, it); fflush(stderr);
+      sandbox.free_in_sandbox(sandboxOut);
+      fprintf(stderr, "[DBG] d=%d it=%d step=18: sandboxOut freed\n", d, it); fflush(stderr);
       sandbox.free_in_sandbox(outBuffer);
       fprintf(stderr, "[DBG] d=%d it=%d step=19: outBuffer freed\n", d, it); fflush(stderr);
       sandbox.free_in_sandbox(outSize);

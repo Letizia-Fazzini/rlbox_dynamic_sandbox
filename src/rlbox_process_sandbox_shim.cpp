@@ -81,6 +81,12 @@ static void init_shm()
     void* got = mmap(
       want_addr, g_shm_size, PROT_READ | PROT_WRITE, flags, fd, 0);
     if (got == MAP_FAILED || got != want_addr) {
+      fprintf(stderr,
+              "[sandbox_shim] FATAL: SHM mmap failed at %p (size=%zu): "
+              "got=%p errno=%d (%s).  Address likely collides with the "
+              "child's library mappings; the host must pick a different base.\n",
+              want_addr, g_shm_size, got, errno, strerror(errno));
+      fflush(stderr);
       g_shm_base = NULL;
     } else {
       g_shm_base = got;
@@ -857,11 +863,11 @@ static void start_rpc_server()
   // dispatch via the shared handlers, write one Response.  EOF on the
   // request fd (host side closed) ends the loop.
   while (true) {
-    capnp::MallocMessageBuilder out;
-    auto resp = out.initRoot<rlbox::wire::Response>();
     int64_t result = 0;
     bool reply = true;
     try {
+      capnp::MallocMessageBuilder out;
+      auto resp = out.initRoot<rlbox::wire::Response>();
       capnp::StreamFdMessageReader reader(req_fd);
       auto req = reader.getRoot<rlbox::wire::Request>();
       switch (req.which()) {
@@ -910,18 +916,38 @@ static void start_rpc_server()
           result = 0;
           break;
       }
-    } catch (const kj::Exception&) {
-      // EOF or framing error — host has gone away.  Stop the loop.
-      reply = false;
-      break;
-    }
-    if (reply) {
-      resp.setResult(result);
-      try {
-        capnp::writeMessageToFd(req_fd, out);
-      } catch (const kj::Exception&) {
-        break;
+      if (reply) {
+        resp.setResult(result);
+        try {
+          capnp::writeMessageToFd(req_fd, out);
+        } catch (const kj::Exception& e) {
+          fprintf(stderr, "[shim] writeMessageToFd failed: %s\n",
+                  e.getDescription().cStr());
+          fflush(stderr);
+          break;
+        }
       }
+    } catch (const kj::Exception& e) {
+      // EOF, framing error, or allocation failure inside capnp — either
+      // the host has gone away or we're out of memory.  Either way we
+      // can't reply meaningfully; just exit the loop.
+      // "Premature EOF" is the normal shutdown signal: the host called
+      // destroy_sandbox() and closed the request fd.  Don't log it.
+      const char* desc = e.getDescription().cStr();
+      if (strstr(desc, "Premature EOF") == nullptr) {
+        fprintf(stderr, "[shim] request loop kj::Exception: %s\n", desc);
+        fflush(stderr);
+      }
+      break;
+    } catch (const std::exception& e) {
+      // Same RTTI-mismatch fallback as the host side.
+      fprintf(stderr, "[shim] request loop std::exception: %s\n", e.what());
+      fflush(stderr);
+      break;
+    } catch (...) {
+      fprintf(stderr, "[shim] request loop unknown exception\n");
+      fflush(stderr);
+      break;
     }
   }
 }
