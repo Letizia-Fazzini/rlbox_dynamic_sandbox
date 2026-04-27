@@ -79,6 +79,12 @@ static void init_shm()
     void* got = mmap(
       want_addr, g_shm_size, PROT_READ | PROT_WRITE, flags, fd, 0);
     if (got == MAP_FAILED || got != want_addr) {
+      fprintf(stderr,
+              "[sandbox_shim] FATAL: SHM mmap failed at %p (size=%zu): "
+              "got=%p errno=%d (%s).  Address likely collides with the "
+              "child's library mappings; the host must pick a different base.\n",
+              want_addr, g_shm_size, got, errno, strerror(errno));
+      fflush(stderr);
       g_shm_base = NULL;
     } else {
       g_shm_base = got;
@@ -107,8 +113,11 @@ static std::mutex g_callback_fd_mutex;
 #  define RLBOX_CALLBACK_SLOTS 64
 #endif
 static constexpr size_t k_callback_slots = RLBOX_CALLBACK_SLOTS;
-// Slot array lives in the shared mspace so pre-forked workers see fresh
-// keys through shared memory rather than their private fork snapshot.
+// The slot array lives in the shared mspace so that pre-forked workers
+// (which inherit the *pointer* at fork time) read up-to-date keys via
+// shared memory, not their own private snapshot. atomic<uintptr_t> is
+// lock-free and standard-layout on the supported host ABIs (x86_64 and
+// i386); placement-new initializes each slot to 0.
 static std::atomic<uintptr_t>* g_callback_keys = nullptr;
 
 static void init_shared_callback_keys()
@@ -798,11 +807,11 @@ static void start_rpc_server()
 
   // Single-threaded request loop. EOF on req_fd ends the loop.
   while (true) {
-    capnp::MallocMessageBuilder out;
-    auto resp = out.initRoot<rlbox::wire::Response>();
     int64_t result = 0;
     bool reply = true;
     try {
+      capnp::MallocMessageBuilder out;
+      auto resp = out.initRoot<rlbox::wire::Response>();
       capnp::StreamFdMessageReader reader(req_fd);
       auto req = reader.getRoot<rlbox::wire::Request>();
       switch (req.which()) {
@@ -851,18 +860,38 @@ static void start_rpc_server()
           result = 0;
           break;
       }
-    } catch (const kj::Exception&) {
-      // EOF or framing error: host has gone away.
-      reply = false;
-      break;
-    }
-    if (reply) {
-      resp.setResult(result);
-      try {
-        capnp::writeMessageToFd(req_fd, out);
-      } catch (const kj::Exception&) {
-        break;
+      if (reply) {
+        resp.setResult(result);
+        try {
+          capnp::writeMessageToFd(req_fd, out);
+        } catch (const kj::Exception& e) {
+          fprintf(stderr, "[shim] writeMessageToFd failed: %s\n",
+                  e.getDescription().cStr());
+          fflush(stderr);
+          break;
+        }
       }
+    } catch (const kj::Exception& e) {
+      // EOF, framing error, or allocation failure inside capnp — either
+      // the host has gone away or we're out of memory.  Either way we
+      // can't reply meaningfully; just exit the loop.
+      // "Premature EOF" is the normal shutdown signal: the host called
+      // destroy_sandbox() and closed the request fd.  Don't log it.
+      const char* desc = e.getDescription().cStr();
+      if (strstr(desc, "Premature EOF") == nullptr) {
+        fprintf(stderr, "[shim] request loop kj::Exception: %s\n", desc);
+        fflush(stderr);
+      }
+      break;
+    } catch (const std::exception& e) {
+      // Same RTTI-mismatch fallback as the host side.
+      fprintf(stderr, "[shim] request loop std::exception: %s\n", e.what());
+      fflush(stderr);
+      break;
+    } catch (...) {
+      fprintf(stderr, "[shim] request loop unknown exception\n");
+      fflush(stderr);
+      break;
     }
   }
 }

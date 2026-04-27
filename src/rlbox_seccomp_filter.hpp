@@ -18,12 +18,13 @@
 //                  syscalls kill the worker via SIGSYS; the host's
 //                  dispatch_to_worker path already handles worker death.
 //
-// The arch gate kills anything that is not AUDIT_ARCH_X86_64, which closes the
-// i386/x32 multiarch backdoor that bypasses x86_64-only filters.  The
-// allowlist below covers what zlib + libjpeg workers issue today, with a
-// small margin for timing/signal/memory paths that future workloads may use.
-// Tightening (mmap-flag filter, futex PI deny, tgkill/kill pid restriction)
-// is intentionally deferred until the audit/enforce phases produce data.
+// The arch gate matches the build's host ABI (AUDIT_ARCH_X86_64 in 64-bit
+// builds, AUDIT_ARCH_I386 in -m32 builds) and kills anything else, closing
+// the multiarch backdoor that would otherwise bypass an arch-specific
+// allowlist.  The allowlist below covers what zlib + libjpeg workers issue
+// today, with a small margin for timing/signal/memory paths that future
+// workloads may use.  Tightening (mmap-flag filter, futex PI deny, tgkill/
+// kill pid restriction) is intentionally deferred.
 
 #include <cerrno>
 #include <cstddef>
@@ -82,18 +83,29 @@ inline bool install_filter(std::uint32_t terminal_action)
     }
   };
 
-  // (1) Arch gate: kill if not x86_64.  Closes the i386/x32 entry-point
-  //     backdoor that would bypass an x86_64-numbered allowlist.
+  // (1) Arch gate: kill if the running ABI doesn't match what we built for.
+  //     Closes the multiarch entry-point backdoor that would bypass an
+  //     allowlist whose syscall numbers belong to a different ABI.
+#if defined(__x86_64__)
+  constexpr std::uint32_t k_expected_arch = AUDIT_ARCH_X86_64;
+#elif defined(__i386__)
+  constexpr std::uint32_t k_expected_arch = AUDIT_ARCH_I386;
+#else
+#  error "rlbox seccomp filter: unsupported host architecture"
+#endif
   push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS,
                 offsetof(struct seccomp_data, arch)));
-  push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0));
+  push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, k_expected_arch, 1, 0));
   push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
 
-  // (2) Load syscall nr; reject x32 syscalls (top bit set in __X32_SYSCALL_BIT).
+  // (2) Load syscall nr; on x86_64 also reject x32 syscalls (top bit set in
+  //     __X32_SYSCALL_BIT).  i386 has no x32, so the gate is x86_64-only.
   push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS,
                 offsetof(struct seccomp_data, nr)));
+#if defined(__x86_64__)
   push(bpf_jump(BPF_JMP | BPF_JGE | BPF_K, 0x40000000u, 0, 1));
   push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+#endif
 
   auto allow_eq = [&](unsigned nr) {
     push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));

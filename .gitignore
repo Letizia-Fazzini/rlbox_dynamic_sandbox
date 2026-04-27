@@ -2,5 +2,4 @@ build*/
 /target/
 /.vscode/
 wasi-sdk*
-bench/plots/
-bench/results/
+CLAUDE.md

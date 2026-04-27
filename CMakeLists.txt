@@ -11,6 +11,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Force a 32-bit (i386) build of every native target in this project.
+#
+# Rationale: the wasm2c backend hands out 32-bit linear-memory offsets, and
+# rlbox_meta_sandbox encodes the owning backend in the *high* bit of
+# T_PointerType.  When the host is 64-bit and the wasm side is 32-bit the
+# two address spaces have different widths, which complicates struct
+# marshaling and the bit-tag scheme.  Building everything as i386 makes
+# host pointers 4 bytes wide so they line up exactly with the wasm side.
+#
+# These options are set BEFORE any FetchContent_MakeAvailable so that
+# rpclib / Cap'n Proto / Catch2 / rlbox subprojects inherit the flag and
+# get rebuilt with -m32 from source (system 32-bit packages are not
+# required for them).  System-level i386 dev libs are still required for
+# libffi / libjpeg-turbo / zlib (e.g. apt install libffi-dev:i386 ...).
+add_compile_options(-m32)
+add_link_options(-m32)
+message(STATUS "rlbox_dynamic: forcing 32-bit (i386) build via -m32")
+
 option(RLBOX_DYNAMIC_BUILD_TESTS "Build unit + integration tests" ON)
 
 # Transport selection ###################

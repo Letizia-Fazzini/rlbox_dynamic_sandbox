@@ -28,8 +28,21 @@ help:
 	@echo "  JOBS=$(JOBS)"
 	@echo "  EXTRA_CMAKE_ARGS=$(EXTRA_CMAKE_ARGS)"
 
+# 32-bit (i386) build flags.
+#
+# We force every translation unit -- including FetchContent deps like rpclib
+# and Cap'n Proto -- to compile with -m32 so host pointers are 4 bytes wide,
+# matching wasm2c's 32-bit linear-memory offsets.  CMAKE_DISABLE_FIND_PACKAGE
+# for CapnProto stops cmake from picking up a 64-bit system libcapnp and
+# silently linking it into the 32-bit shim.
+M32_CMAKE_ARGS ?= -DCMAKE_C_FLAGS=-m32 \
+                  -DCMAKE_CXX_FLAGS=-m32 \
+                  -DCMAKE_EXE_LINKER_FLAGS=-m32 \
+                  -DCMAKE_SHARED_LINKER_FLAGS=-m32 \
+                  -DCMAKE_DISABLE_FIND_PACKAGE_CapnProto=ON
+
 $(BUILD_DIR)/CMakeCache.txt:
-	$(CMAKE) -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(EXTRA_CMAKE_ARGS)
+	$(CMAKE) -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(M32_CMAKE_ARGS) $(EXTRA_CMAKE_ARGS)
 
 configure: $(BUILD_DIR)/CMakeCache.txt
 
