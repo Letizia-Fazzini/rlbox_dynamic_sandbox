@@ -31,6 +31,29 @@ if(NOT RLBOX_TRANSPORT STREQUAL "rpclib" AND
 endif()
 message(STATUS "rlbox_dynamic transport: ${RLBOX_TRANSPORT}")
 
+# Seccomp-bpf syscall filter for the worker fork ###################
+#
+# off     -- no filter installed (default; preserves today's behavior).
+# audit   -- SECCOMP_RET_LOG on denied syscalls; library still runs.  Requires
+#            'log' in /proc/sys/kernel/seccomp/actions_avail and actions_logged.
+# enforce -- SECCOMP_RET_KILL_PROCESS on denied syscalls.  Worker dies; refill
+#            loop respawns.
+set(RLBOX_SECCOMP "off" CACHE STRING
+    "Seccomp filter mode for the worker fork: off | audit | enforce")
+set_property(CACHE RLBOX_SECCOMP PROPERTY STRINGS off audit enforce)
+
+if(RLBOX_SECCOMP STREQUAL "off")
+  set(_rlbox_seccomp_mode 0)
+elseif(RLBOX_SECCOMP STREQUAL "audit")
+  set(_rlbox_seccomp_mode 1)
+elseif(RLBOX_SECCOMP STREQUAL "enforce")
+  set(_rlbox_seccomp_mode 2)
+else()
+  message(FATAL_ERROR
+          "RLBOX_SECCOMP must be 'off', 'audit', or 'enforce', got '${RLBOX_SECCOMP}'")
+endif()
+message(STATUS "rlbox_dynamic seccomp: ${RLBOX_SECCOMP}")
+
 # Dependencies ###################
 
 include(FetchContent)
@@ -206,6 +229,8 @@ else()
   target_link_libraries(sandbox_shim PRIVATE rlbox_capnp_schema)
   target_compile_definitions(sandbox_shim PRIVATE RLBOX_TRANSPORT_CAPNP=1)
 endif()
+target_compile_definitions(sandbox_shim PRIVATE
+                           RLBOX_SECCOMP_MODE=${_rlbox_seccomp_mode})
 set_target_properties(sandbox_shim PROPERTIES
                       PREFIX ""              # produce "sandbox_shim.so"
                       OUTPUT_NAME sandbox_shim)

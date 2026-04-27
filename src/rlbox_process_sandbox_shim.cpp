@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 #include "rlbox_process_abi.hpp"
+#include "rlbox_seccomp_filter.hpp"
 
 #if !defined(RLBOX_TRANSPORT_RPCLIB) && !defined(RLBOX_TRANSPORT_CAPNP)
 #  define RLBOX_TRANSPORT_RPCLIB 1
@@ -466,6 +467,12 @@ static void worker_main(int req_fd, int resp_fd)
         !read_full(req_fd, arg_values, hdr.nargs * sizeof(int64_t))) {
       _exit(1);
     }
+  }
+
+  // Lock down syscalls before handing control to library code.  Worker is
+  // single-threaded here; failure means we bail rather than run unfiltered.
+  if (!rlbox::seccomp::apply_filter(rlbox::seccomp::compile_mode())) {
+    _exit(2);
   }
 
   int64_t result = do_ffi_call(
