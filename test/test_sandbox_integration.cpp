@@ -90,7 +90,7 @@ TEST_CASE("sandbox lifecycle: create then destroy cleanly",
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
   CHECK(s.impl_get_memory_location() != nullptr);
-  CHECK(s.impl_get_total_memory() == 64ull * 1024ull * 1024ull);
+  CHECK(s.impl_get_total_memory() == 0x100000000ull);
   CHECK(rlbox::detail::thread_local_sandbox == &s);
   CHECK(s.transport_alive());
 

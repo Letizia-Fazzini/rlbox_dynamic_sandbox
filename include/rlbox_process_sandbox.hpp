@@ -34,6 +34,11 @@
 #  define RLBOX_TRANSPORT_RPCLIB 1
 #endif
 
+// Set to 0 for the registry-walking slow path.
+#ifndef RLBOX_PROCESS_FAST_SANDBOX_LOOKUP
+#  define RLBOX_PROCESS_FAST_SANDBOX_LOOKUP 1
+#endif
+
 #if defined(RLBOX_TRANSPORT_RPCLIB)
 #  include "rpc/client.h"
 #  include "rpc/server.h"
@@ -61,6 +66,11 @@ public:
   using T_IntType = int32_t;
   using T_PointerType = uintptr_t;
   using T_ShortType = int16_t;
+
+  // 4 GB-aligned shared region; gates O(1) sandbox lookup.
+  static constexpr uintptr_t shared_memory_alignment = 0x100000000ull;
+  static constexpr bool is_aligned_shared_memory =
+    (RLBOX_PROCESS_FAST_SANDBOX_LOOKUP != 0);
 
 protected:
   uintptr_t shared_memory_local_base = 0;
@@ -276,17 +286,17 @@ public:
   template<typename T_Char>
   inline bool impl_create_sandbox(const T_Char* library_path)
   {
-    // 1. Create shared memory region
-    shared_memory_size = 1024 * 1024 * 64; // 64MB example
+    // 1. Create shared memory region. Sparse memfd backing means RAM
+    // commits only as pages are touched.
+    shared_memory_size = shared_memory_alignment;
     int shm_fd = memfd_create("rlbox_shm", 0);
     if (shm_fd == -1)
       return false;
     ftruncate(shm_fd, shared_memory_size);
 
     // 2. Map it in the host
-    // Use aligned mapping to simplify pointer translation and sandbox lookup
-    size_t alignment = 0x100000000ull; // 4GB alignment
-    void* aligned_addr = os_mmap_aligned(shared_memory_size, alignment);
+    void* aligned_addr =
+      os_mmap_aligned(shared_memory_size, shared_memory_alignment);
     if (!aligned_addr) {
       close(shm_fd);
       return false;
@@ -478,8 +488,14 @@ public:
     if (p == 0) {
       return nullptr;
     }
-    auto sandbox = expensive_sandbox_finder(example_unsandboxed_ptr);
-    return sandbox->impl_get_unsandboxed_pointer<T>(p);
+    if constexpr (is_aligned_shared_memory) {
+      (void)example_unsandboxed_ptr;
+      (void)expensive_sandbox_finder;
+      return reinterpret_cast<void*>(p);
+    } else {
+      auto sandbox = expensive_sandbox_finder(example_unsandboxed_ptr);
+      return sandbox->impl_get_unsandboxed_pointer<T>(p);
+    }
   }
 
   template<typename T>
@@ -492,8 +508,14 @@ public:
     if (p == 0) {
       return 0;
     }
-    auto sandbox = expensive_sandbox_finder(example_unsandboxed_ptr);
-    return sandbox->impl_get_sandboxed_pointer<T>(p);
+    if constexpr (is_aligned_shared_memory) {
+      (void)example_unsandboxed_ptr;
+      (void)expensive_sandbox_finder;
+      return reinterpret_cast<T_PointerType>(p);
+    } else {
+      auto sandbox = expensive_sandbox_finder(example_unsandboxed_ptr);
+      return sandbox->impl_get_sandboxed_pointer<T>(p);
+    }
   }
 
   // Static because rlbox calls this without an instance. Returns true
@@ -501,20 +523,27 @@ public:
   // are outside every sandbox.
   static inline bool impl_is_in_same_sandbox(const void* p1, const void* p2)
   {
-    auto addr1 = reinterpret_cast<uintptr_t>(p1);
-    auto addr2 = reinterpret_cast<uintptr_t>(p2);
-    std::lock_guard<std::mutex> lock(registry_mutex);
-    auto sandbox_of = [&](uintptr_t a) -> rlbox_process_sandbox* {
-      for (auto& entry : global_registry) {
-        auto base = entry.first;
-        auto size = entry.second->shared_memory_size;
-        if (a >= base && a < base + size) {
-          return entry.second;
+    if constexpr (is_aligned_shared_memory) {
+      constexpr uintptr_t heap_base_mask =
+        ~(shared_memory_alignment - 1);
+      return (reinterpret_cast<uintptr_t>(p1) & heap_base_mask) ==
+             (reinterpret_cast<uintptr_t>(p2) & heap_base_mask);
+    } else {
+      auto addr1 = reinterpret_cast<uintptr_t>(p1);
+      auto addr2 = reinterpret_cast<uintptr_t>(p2);
+      std::lock_guard<std::mutex> lock(registry_mutex);
+      auto sandbox_of = [&](uintptr_t a) -> rlbox_process_sandbox* {
+        for (auto& entry : global_registry) {
+          auto base = entry.first;
+          auto size = entry.second->shared_memory_size;
+          if (a >= base && a < base + size) {
+            return entry.second;
+          }
         }
-      }
-      return nullptr;
-    };
-    return sandbox_of(addr1) == sandbox_of(addr2);
+        return nullptr;
+      };
+      return sandbox_of(addr1) == sandbox_of(addr2);
+    }
   }
   inline bool impl_is_pointer_in_sandbox_memory(const void* p)
   {
