@@ -113,11 +113,8 @@ static std::mutex g_callback_fd_mutex;
 #  define RLBOX_CALLBACK_SLOTS 64
 #endif
 static constexpr size_t k_callback_slots = RLBOX_CALLBACK_SLOTS;
-// The slot array lives in the shared mspace so that pre-forked workers
-// (which inherit the *pointer* at fork time) read up-to-date keys via
-// shared memory, not their own private snapshot. atomic<uintptr_t> is
-// lock-free and standard-layout on the supported host ABIs (x86_64 and
-// i386); placement-new initializes each slot to 0.
+// Slot array in the shared mspace so pre-forked workers see up-to-date
+// keys (atomic<uintptr_t> is lock-free + standard-layout on x86_64/i386).
 static std::atomic<uintptr_t>* g_callback_keys = nullptr;
 
 static void init_shared_callback_keys()
@@ -320,13 +317,8 @@ static ffi_type* ffi_type_for_tag(int32_t tag)
 // Bounds the stack arrays in do_ffi_call and validates wire nargs.
 static constexpr size_t k_max_args = 32;
 
-// Run ffi_call. Caller must ensure isolation -- we run this either in a
-// freshly-forked child (inline path) or in a pre-forked worker that
-// exits immediately afterward (pool path).
-//
-// Stack scratch only: the dlmalloc mspace mutex lives in shared memory,
-// and post-fork allocation would deadlock if another thread held it at
-// fork time. Don't introduce allocations here.
+// Run ffi_call inside a one-shot fork or pool worker.  Stack scratch only --
+// the dlmalloc mspace mutex is shared, so post-fork allocation can deadlock.
 static int64_t do_ffi_call(uintptr_t func_addr,
                            int32_t ret_tag,
                            const int32_t* arg_tags,
@@ -397,10 +389,8 @@ static int64_t do_ffi_call(uintptr_t func_addr,
   return 0;
 }
 
-// Pre-forked worker pool. Each worker still runs one call and exits
-// (one-call-per-child preserved); the pool just hides fork() latency.
-// Configurable via RLBOX_WORKER_POOL_SIZE; 0 disables and falls back
-// to inline fork.
+// Pre-forked worker pool: each worker runs one call and exits, so the
+// one-call-per-child invariant holds.  RLBOX_WORKER_POOL_SIZE=0 disables.
 
 struct Worker
 {
@@ -872,7 +862,7 @@ static void start_rpc_server()
         }
       }
     } catch (const kj::Exception& e) {
-      // EOF, framing error, or allocation failure inside capnp — either
+      // EOF, framing error, or allocation failure inside capnp -- either
       // the host has gone away or we're out of memory.  Either way we
       // can't reply meaningfully; just exit the loop.
       // "Premature EOF" is the normal shutdown signal: the host called

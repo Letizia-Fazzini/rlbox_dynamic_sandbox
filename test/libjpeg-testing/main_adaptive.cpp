@@ -16,11 +16,8 @@ static double monotonic_ms()
 
 // We're going to use RLBox in a single-threaded environment.
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
-// The meta-sandbox resolves symbols dynamically per-backend at dispatch time;
-// do NOT define RLBOX_USE_STATIC_CALLS() here (see rlbox_meta_sandbox.hpp).
-// The wasm2c module name and generated header must be set up before the meta
-// include so the meta header (which re-includes rlbox_wasm2c_sandbox.hpp
-// internally) can see them.
+// Meta resolves symbols dynamically per backend; do NOT enable
+// RLBOX_USE_STATIC_CALLS().  Wasm preamble must precede the meta include.
 #define RLBOX_WASM2C_MODULE_NAME jpeg
 
 // Include the produced header from wasm2c

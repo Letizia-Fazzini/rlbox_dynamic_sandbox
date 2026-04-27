@@ -1,8 +1,4 @@
-// Meta-sandbox driver for zlib: composes process + wasm2c behind one rlbox
-// handle and dispatches each invoke through a runtime-selectable policy.
-// Same workload shape as main_process.cpp so the bench harness can compare
-// directly against pure backends.
-//
+// Meta-sandbox driver for zlib.  Same workload shape as main_process.cpp.
 //   ./main_meta <level> <policy>
 //     level  in 1..9 (default 2)
 //     policy in {process, wasm, adaptive} (default process)
@@ -30,10 +26,7 @@ static double monotonic_ms() {
 
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
 
-// Wasm preamble for the meta header. Do NOT define RLBOX_USE_STATIC_CALLS:
-// the meta resolves symbols dynamically per backend; the static-calls
-// fast path would bind host VAs at compile time and silently no-op the
-// process route.
+// Wasm preamble for the meta; do NOT enable RLBOX_USE_STATIC_CALLS.
 #define RLBOX_WASM2C_MODULE_NAME zlib
 #include "zlib.wasm.h"
 #include "rlbox.hpp"

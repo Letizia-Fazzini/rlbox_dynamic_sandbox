@@ -1,30 +1,17 @@
 #pragma once
 
-// Seccomp-bpf syscall filter applied per-worker in the process backend.
+// Per-worker seccomp-bpf syscall filter for the process backend.
+// Installed in worker_main after the wire payload read, before do_ffi_call
+// (worker is single-threaded there, so no TSYNC).
 //
-// Intended call site: worker_main, after the wire job header + payload have
-// been read but before do_ffi_call.  The worker is single-threaded by
-// construction at that point (no TSYNC needed), and any setup syscalls the
-// shim itself needs have already happened.
+// RLBOX_SECCOMP_MODE selects the terminal action:
+//   0 Off     -- no-op.
+//   1 Audit   -- SECCOMP_RET_LOG: log to dmesg/audit and allow through.
+//                Requires "log" in /proc/sys/kernel/seccomp/actions_logged.
+//   2 Enforce -- SECCOMP_RET_KILL_PROCESS: SIGSYS kills the worker.
 //
-// Modes (selected at build time via RLBOX_SECCOMP_MODE):
-//   0 (Off)     -- no-op.
-//   1 (Audit)   -- terminal action is SECCOMP_RET_LOG.  Denied syscalls are
-//                  logged via dmesg/audit and *allowed* through, so workloads
-//                  run unimpeded while the allowlist is being shaken out.
-//                  Requires the kernel to have "log" enabled in
-//                  /proc/sys/kernel/seccomp/actions_logged.
-//   2 (Enforce) -- terminal action is SECCOMP_RET_KILL_PROCESS.  Denied
-//                  syscalls kill the worker via SIGSYS; the host's
-//                  dispatch_to_worker path already handles worker death.
-//
-// The arch gate matches the build's host ABI (AUDIT_ARCH_X86_64 in 64-bit
-// builds, AUDIT_ARCH_I386 in -m32 builds) and kills anything else, closing
-// the multiarch backdoor that would otherwise bypass an arch-specific
-// allowlist.  The allowlist below covers what zlib + libjpeg workers issue
-// today, with a small margin for timing/signal/memory paths that future
-// workloads may use.  Tightening (mmap-flag filter, futex PI deny, tgkill/
-// kill pid restriction) is intentionally deferred.
+// Arch gate matches the build (AUDIT_ARCH_X86_64 / AUDIT_ARCH_I386) and
+// kills anything else, closing the multiarch backdoor.
 
 #include <cerrno>
 #include <cstddef>
@@ -83,9 +70,7 @@ inline bool install_filter(std::uint32_t terminal_action)
     }
   };
 
-  // (1) Arch gate: kill if the running ABI doesn't match what we built for.
-  //     Closes the multiarch entry-point backdoor that would bypass an
-  //     allowlist whose syscall numbers belong to a different ABI.
+  // (1) Arch gate: kill if running ABI != built ABI.
 #if defined(__x86_64__)
   constexpr std::uint32_t k_expected_arch = AUDIT_ARCH_X86_64;
 #elif defined(__i386__)
@@ -98,8 +83,7 @@ inline bool install_filter(std::uint32_t terminal_action)
   push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, k_expected_arch, 1, 0));
   push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
 
-  // (2) Load syscall nr; on x86_64 also reject x32 syscalls (top bit set in
-  //     __X32_SYSCALL_BIT).  i386 has no x32, so the gate is x86_64-only.
+  // (2) Load syscall nr; on x86_64 reject x32 (i386 has no x32).
   push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS,
                 offsetof(struct seccomp_data, nr)));
 #if defined(__x86_64__)
@@ -112,9 +96,8 @@ inline bool install_filter(std::uint32_t terminal_action)
     push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
   };
 
-  // (3) Allowlist.  Empirically zlib + libjpeg workers issue only `write`
-  //     and `exit_group` after the filter point; the rest of this list is
-  //     headroom for memory/signal/timing syscalls future workloads may need.
+  // (3) Allowlist (zlib + libjpeg workers issue only write/exit_group;
+  //     rest is headroom for future workloads).
   allow_eq(SYS_read);
   allow_eq(SYS_write);
   allow_eq(SYS_writev);
@@ -158,11 +141,8 @@ inline bool install_filter(std::uint32_t terminal_action)
 
 }  // namespace detail
 
-// Apply the configured seccomp filter to the calling thread.  Returns true
-// on success; on failure the caller should _exit(2) so the host sees the
-// worker die rather than running unfiltered code.
-//
-// Caller must already be in single-thread state for this thread; no TSYNC.
+// Apply the configured filter; caller must _exit(2) on false so the host
+// sees the worker die rather than run unfiltered.
 inline bool apply_filter(Mode mode)
 {
   if (mode == Mode::Off) {
