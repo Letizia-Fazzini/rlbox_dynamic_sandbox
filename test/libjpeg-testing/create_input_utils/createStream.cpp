@@ -16,7 +16,7 @@
 #include <cstdlib>
 
 int main() {
-    const char* input_path  = "sample_image.png";
+    const char* input_path  = "duck.png";
     const char* output_path = "rgb_grid.txt";
 
     int width, height, channels;

@@ -55,14 +55,26 @@ int main(int argc, char const *argv[]) {
       fscanf(source, "%d %d %d", &image_width, &image_height, &image_channels);
       int row_stride = image_width * image_channels;
 
-      auto sandboxSrc = sandbox.malloc_in_sandbox<unsigned char>(image_height * row_stride);
+      //set up output buffer pointers inside sandbox.  We pre-allocate the
+      //JPEG output buffer ourselves and pass TJFLAG_NOREALLOC so
+      //libjpeg-turbo won't replace it with an internal tjAlloc'd buffer.
+      auto maxSize = sandbox.invoke_sandbox_function(tjBufSize, image_width, image_height, TJSAMP_444);
+      auto verifiedMaxSize = maxSize.copy_and_verify([](unsigned long ret) {
+        release_assert(ret != 0, "max size cannot be 0");
+        return ret;
+      });
+      auto sandboxOut = sandbox.malloc_in_sandbox<unsigned char>(verifiedMaxSize);
 
-      for(int i = 0; i < image_height; i++) {
-        for (int j = 0; j < row_stride; j++) {
-          int val;
-          fscanf(source, "%d", &val);
-          sandboxSrc[i * row_stride + j] = (unsigned char)val;
-        }
+      auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
+      *outBuffer = sandboxOut;
+      auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
+      *outSize = verifiedMaxSize;
+
+      auto sandboxSrc = sandbox.malloc_in_sandbox<unsigned char>(image_height * row_stride);
+      for (int i = 0; i < image_height * row_stride; i++) {
+        int val;
+        fscanf(source, "%d", &val);
+        sandboxSrc[i] = (unsigned char)val;
       }
       fclose(source);
 
@@ -71,11 +83,6 @@ int main(int argc, char const *argv[]) {
         fprintf(stderr, "can't open output file\n");
         exit(1);
       }
-
-      auto outBuffer = sandbox.malloc_in_sandbox<unsigned char*>();
-      *outBuffer = nullptr;
-      auto outSize   = sandbox.malloc_in_sandbox<unsigned long>();
-      *outSize = 0;
 
       double t_start = monotonic_ms();
       auto tjHandle = sandbox.invoke_sandbox_function(tjInitCompress);
@@ -92,7 +99,7 @@ int main(int argc, char const *argv[]) {
         outSize,
         TJSAMP_444,
         quality,
-        0
+        TJFLAG_NOREALLOC
       );
       compress_ret.copy_and_verify([](int ret) {
         release_assert(ret == 0, "tjCompress2 failed");
@@ -100,7 +107,7 @@ int main(int argc, char const *argv[]) {
       });
 
       sandbox.invoke_sandbox_function(tjDestroy, tjHandle);
-      printf("COMPRESSION_MS=%.3f\n", monotonic_ms() - t_start);
+      printf("COMPRESSION_MS=%.3f\n", monotonic_ms() - t_start); fflush(stdout);
 
       sandbox.free_in_sandbox(sandboxSrc);
 
@@ -119,7 +126,7 @@ int main(int argc, char const *argv[]) {
       fwrite(localBuffer.get(), 1, verifiedSize, destinationFile);
       fclose(destinationFile);
 
-      sandbox.free_in_sandbox(*outBuffer);
+      sandbox.free_in_sandbox(sandboxOut);
       sandbox.free_in_sandbox(outBuffer);
       sandbox.free_in_sandbox(outSize);
     }
