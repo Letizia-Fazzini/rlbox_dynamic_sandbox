@@ -2,6 +2,10 @@
 
 A process-isolation backend for [RLBox](https://github.com/PLSysSec/rlbox). Each sandboxed function call runs in a fresh OS process, so we can compare per-call process isolation against the stock wasm2c backend.
 
+## IMPORTANT BRANCH INFORMATION
+
+Besides this branch, which contains the global adaptive sandbox, our attempt at a per-function dynamic sandbox can be found in the "shared_mem" branch.
+
 ## Layout
 
 | Path | What it is |
