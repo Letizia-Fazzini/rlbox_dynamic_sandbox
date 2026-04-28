@@ -90,7 +90,7 @@ TEST_CASE("sandbox lifecycle: create then destroy cleanly",
   REQUIRE(s.impl_create_sandbox(TEST_SANDBOX_WRAPPER_PATH));
 
   CHECK(s.impl_get_memory_location() != nullptr);
-  CHECK(s.impl_get_total_memory() == 0x100000000ull);
+  CHECK(s.impl_get_total_memory() == RLBOX_SHM_REGION_BYTES);
   CHECK(rlbox::detail::thread_local_sandbox == &s);
   CHECK(s.transport_alive());
 
@@ -220,11 +220,14 @@ TEST_CASE("invoke writes through a POINTER-tagged arg into shared memory",
   auto encoded = s.raw_lookup_symbol("glue_write_int64");
   REQUIRE(encoded != 0);
 
-  // ARG_POINTER carries an absolute address; the callee writes through it
-  // and the host sees the result via MAP_SHARED.
+  // ARG_POINTER carries a 32-bit shared-region offset on the wire (Phase
+  // 7b); shim adds its base back before passing to the library, then writes
+  // through it.  Host sees the result via MAP_SHARED.
+  auto base =
+    reinterpret_cast<uintptr_t>(s.impl_get_memory_location());
+  int64_t addr_off = static_cast<int64_t>(static_cast<uintptr_t>(addr) - base);
   std::vector<int32_t> arg_tags = { rlbox::ARG_POINTER, rlbox::ARG_SINT64 };
-  std::vector<int64_t> arg_values = { static_cast<int64_t>(addr),
-                                      0xDEADBEEFLL };
+  std::vector<int64_t> arg_values = { addr_off, 0xDEADBEEFLL };
   int64_t result =
     s.raw_invoke(encoded, (int32_t)rlbox::ARG_SINT64, arg_tags, arg_values);
 

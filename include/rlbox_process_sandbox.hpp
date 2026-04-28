@@ -53,13 +53,34 @@ namespace rlbox {
 class rlbox_process_sandbox
 {
 public:
-  // The child is a native process sharing the host ABI, so widths mirror
-  // the host; T_PointerType stays unsigned (rlbox serializes it as offset).
+  // Widths mirror the *shim*'s arch, not the host's.  Phase 7c i386 shim:
+  // T_LongType=int32, T_PointerType=uint32 (host VAs in the shared region
+  // fit in 32 bits because the host mapping is constrained to low 4 GiB).
   using T_LongLongType = int64_t;
-  using T_LongType = int64_t;
   using T_IntType = int32_t;
-  using T_PointerType = uintptr_t;
   using T_ShortType = int16_t;
+#if RLBOX_PROCESS_SHIM_TARGET_BITS == 32
+  using T_LongType = int32_t;
+  using T_PointerType = uint32_t;
+#else
+  using T_LongType = int64_t;
+  using T_PointerType = uintptr_t;
+#endif
+
+  // Convert a host pointer (data or function) to T_PointerType.  When
+  // T_PointerType is narrower than uintptr_t (i386 shim on x86_64 host),
+  // the host VA's high bits are zero in the constrained shared-region range
+  // and shim text segment (which fits in 32 bits).
+  template<typename T>
+  static inline T_PointerType host_ptr_to_sbx(T* p)
+  {
+    return static_cast<T_PointerType>(reinterpret_cast<uintptr_t>(p));
+  }
+  // Inverse: widen back to a host pointer for dereferencing on this side.
+  static inline void* sbx_ptr_to_host(T_PointerType p)
+  {
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(p));
+  }
 
 protected:
   uintptr_t shared_memory_local_base = 0;
@@ -233,7 +254,7 @@ public:
     try {
       auto result =
         sandbox_client->call("lookup_symbol", std::string(func_name));
-      return reinterpret_cast<void*>(result.as<T_PointerType>());
+      return sbx_ptr_to_host(result.as<T_PointerType>());
     } catch (const std::exception&) {
       return nullptr;
     }
@@ -283,30 +304,27 @@ public:
   template<typename T_Char>
   inline bool impl_create_sandbox(const T_Char* library_path)
   {
-    // 1. Create shared memory region
-    shared_memory_size = 1024 * 1024 * 64; // 64MB example
+    // 1. Create shared memory region. Sized for both wasm linear memory
+    // (low) and the process mspace (anchored at RLBOX_SHM_PROCESS_OFFSET)
+    // so the meta can reuse this region as wasm's heap. Sparse memfd
+    // backing only commits RAM for touched pages.
+    shared_memory_size = RLBOX_SHM_REGION_BYTES;
     int shm_fd = memfd_create("rlbox_shm", 0);
     if (shm_fd == -1)
       return false;
     ftruncate(shm_fd, shared_memory_size);
 
-    // 2. Map it in the host
-    // Use aligned mapping to simplify pointer translation and sandbox lookup.
-    // In 64-bit, align to 4 GB so the upper 32 bits of any sandboxed pointer
-    // are a constant (enabling fast base recovery via masking).  In 32-bit the
-    // entire address space is only 4 GB so that alignment is impossible;
-    // ordinary page alignment is sufficient because offsets are just
-    // (ptr - base) and always fit in uintptr_t.
-#if UINTPTR_MAX > 0xFFFFFFFFull
-    size_t alignment = 0x100000000ull; // 4 GB alignment (64-bit only)
-    void* aligned_addr = os_mmap_aligned(shared_memory_size, alignment);
-#else
-    // 32-bit: must reproduce the same VA in the child after fork+exec.
-    // Default kernel placement collides with the child's library mappings;
-    // hint into the reliably-free 0x40000000-0x80000000 gap instead.
+    // 2. Map into low-4-GiB host VA, 1-GiB-aligned (matches RLBOX_SHM_REGION_BYTES),
+    // so a future i386 shim can mmap the same region at the same VA. Default
+    // kernel placement is too high or collides with i386 library mappings,
+    // so we try a fixed hint table. Pointer translation uses explicit
+    // (host_va - heap_base) -- no 4-GiB-alignment dependency.
     void* aligned_addr = nullptr;
+    // Hint addresses chosen low enough to avoid ASLR-randomized PIE bases
+    // and shared libs in the i386 shim (libs typically ~0xf0000000+, PIE
+    // ~0x40000000–0x70000000).  1-GiB-aligned to match RLBOX_SHM_REGION_BYTES.
     static const uintptr_t k_hint_addrs[] = {
-      0x40000000u, 0x50000000u, 0x60000000u, 0x70000000u
+      0x10000000u, 0x20000000u, 0x30000000u, 0x40000000u
     };
     for (uintptr_t hint : k_hint_addrs) {
       void* res = mmap(reinterpret_cast<void*>(hint),
@@ -324,7 +342,6 @@ public:
         munmap(res, shared_memory_size); // kernel ignored our hint
       }
     }
-#endif
     if (!aligned_addr) {
       close(shm_fd);
       return false;
@@ -491,6 +508,15 @@ public:
       waitpid(pid, nullptr, 0);
       child_process_handle = nullptr;
     }
+
+    // Free the shared region so subsequent create_sandbox calls can reuse
+    // the same hint slots; the slot table is small (four 1-GiB-aligned VAs
+    // in low 4 GiB) and would exhaust within a handful of tests if leaked.
+    if (shared_memory_local_base != 0) {
+      munmap(reinterpret_cast<void*>(shared_memory_local_base),
+             shared_memory_size);
+      shared_memory_local_base = 0;
+    }
   }
 
   // Host and child map shared memory at the same VA, so sandbox pointers
@@ -498,13 +524,13 @@ public:
   template<typename T>
   inline void* impl_get_unsandboxed_pointer(T_PointerType p) const
   {
-    return reinterpret_cast<void*>(p);
+    return sbx_ptr_to_host(p);
   }
 
   template<typename T>
   inline T_PointerType impl_get_sandboxed_pointer(const void* p) const
   {
-    return reinterpret_cast<T_PointerType>(p);
+    return host_ptr_to_sbx(p);
   }
 
   template<typename T>
@@ -574,17 +600,33 @@ public:
     return reinterpret_cast<void*>(shared_memory_local_base);
   }
 
-  // Widen a converted arg into an int64 wire slot; pointers arrive as
-  // T_PointerType already so cast straight in.
-  template<typename A>
-  static int64_t pack_slot(A&& v)
+  // Widen a converted arg into an int64 wire slot.  Encoding is driven by
+  // the *original* C type so a data pointer rides as a 32-bit shared-region
+  // offset, a function pointer rides as an absolute shim-side VA, and
+  // scalars are widened straight in.
+  template<typename Orig, typename A>
+  inline int64_t encode_arg_for_wire(A&& v) const
   {
-    using U = std::remove_cv_t<std::remove_reference_t<A>>;
-    if constexpr (std::is_pointer_v<U>) {
-      return static_cast<int64_t>(reinterpret_cast<uintptr_t>(v));
+    constexpr arg_type tag = abi_detail::tag_of_v<Orig>;
+    if constexpr (tag == ARG_POINTER) {
+      auto p = static_cast<uintptr_t>(v);
+      if (p == 0) {
+        return 0;
+      }
+      return static_cast<int64_t>(p - shared_memory_local_base);
+    } else if constexpr (tag == ARG_CALLBACK_HANDLE) {
+      return static_cast<int64_t>(static_cast<uintptr_t>(v));
     } else {
       return static_cast<int64_t>(v);
     }
+  }
+
+  template<typename Tuple, std::size_t... I, typename... A>
+  inline std::vector<int64_t> encode_args_for_wire(std::index_sequence<I...>,
+                                                   A&&... a) const
+  {
+    return { encode_arg_for_wire<std::tuple_element_t<I, Tuple>>(
+      std::forward<A>(a))... };
   }
 
   template<typename T, typename T_Converted, typename... T_Args>
@@ -597,8 +639,8 @@ public:
     detail::dynamic_check(request_fd >= 0, "Sandbox not initialized");
 #endif
 
-    // Recover original (pre-conversion) types so we can emit ARG_POINTER
-    // for real pointer args.
+    // Recover original (pre-conversion) types so we can emit ARG_POINTER /
+    // ARG_CALLBACK_HANDLE for real pointer args based on the C type.
     using orig_args_tuple = typename abi_detail::function_traits<T>::args_tuple;
     using orig_ret_type = typename abi_detail::function_traits<T>::return_type;
 
@@ -607,21 +649,23 @@ public:
     build_tags_from_tuple<orig_args_tuple>(
       arg_tags, std::make_index_sequence<sizeof...(T_Args)>{});
 
-    std::vector<int64_t> arg_values{ pack_slot(std::forward<T_Args>(params))... };
+    std::vector<int64_t> arg_values = encode_args_for_wire<orig_args_tuple>(
+      std::make_index_sequence<sizeof...(T_Args)>{},
+      std::forward<T_Args>(params)...);
 
     constexpr int32_t ret_tag = abi_detail::tag_of_v<orig_ret_type>;
 
 #if defined(RLBOX_TRANSPORT_RPCLIB)
     if constexpr (std::is_void_v<orig_ret_type>) {
       sandbox_client->call("invoke",
-                           reinterpret_cast<T_PointerType>(func_ptr),
+                           host_ptr_to_sbx(func_ptr),
                            ret_tag,
                            arg_tags,
                            arg_values);
     } else {
       auto result =
         sandbox_client->call("invoke",
-                             reinterpret_cast<T_PointerType>(func_ptr),
+                             host_ptr_to_sbx(func_ptr),
                              ret_tag,
                              arg_tags,
                              arg_values);
@@ -629,7 +673,7 @@ public:
       // For pointer returns rlbox wants T_PointerType; for scalars the
       // caller's static_cast handles any further narrowing.
       if constexpr (std::is_pointer_v<orig_ret_type>) {
-        return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
+        return decode_pointer_return<orig_ret_type>(raw);
       } else {
         return static_cast<orig_ret_type>(raw);
       }
@@ -637,7 +681,7 @@ public:
 #elif defined(RLBOX_TRANSPORT_CAPNP)
     int64_t raw = capnp_call([&](wire::Request::Builder& req) {
       auto inv = req.initInvoke();
-      inv.setFuncAddr(reinterpret_cast<T_PointerType>(func_ptr));
+      inv.setFuncAddr(host_ptr_to_sbx(func_ptr));
       inv.setRetTag(ret_tag);
       auto tags = inv.initArgTags(arg_tags.size());
       for (size_t i = 0; i < arg_tags.size(); ++i) {
@@ -652,7 +696,7 @@ public:
       (void)raw;
       return;
     } else if constexpr (std::is_pointer_v<orig_ret_type>) {
-      return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
+      return decode_pointer_return<orig_ret_type>(raw);
     } else {
       return static_cast<orig_ret_type>(raw);
     }
@@ -669,39 +713,71 @@ private:
      ...);
   }
 
+  // Inverse of encode_arg_for_wire for the return value: data pointers
+  // arrive as 32-bit shared-region offsets (host adds base), callback
+  // handles arrive as absolute shim VAs (pass through), null is 0.
+  template<typename Orig>
+  inline T_PointerType decode_pointer_return(int64_t raw) const
+  {
+    constexpr arg_type tag = abi_detail::tag_of_v<Orig>;
+    if constexpr (tag == ARG_POINTER) {
+      if (raw == 0) {
+        return static_cast<T_PointerType>(0);
+      }
+      return static_cast<T_PointerType>(
+        static_cast<uintptr_t>(raw) + shared_memory_local_base);
+    } else {
+      return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
+    }
+  }
+
 public:
 
   inline T_PointerType impl_malloc_in_sandbox(size_t size)
   {
+    // Shim returns a 32-bit shared-region offset; host re-adds the base
+    // so T_PointerType remains an absolute host VA (impl_get_*_pointer
+    // hooks rely on that).
+    int64_t raw = 0;
 #if defined(RLBOX_TRANSPORT_RPCLIB)
     if (!sandbox_client) {
       return 0;
     }
     try {
-      // dlmalloc in the child; absolute address valid on both sides.
       auto result = sandbox_client->call("malloc", size);
-      return result.as<T_PointerType>();
+      raw = result.template as<int64_t>();
     } catch (const std::exception&) {
       return 0;
     }
 #elif defined(RLBOX_TRANSPORT_CAPNP)
-    int64_t raw = capnp_call(
+    raw = capnp_call(
       [&](wire::Request::Builder& req) { req.setAllocate(size); });
-    return static_cast<T_PointerType>(static_cast<uint64_t>(raw));
 #endif
+    if (raw == 0) {
+      return static_cast<T_PointerType>(0);
+    }
+    return static_cast<T_PointerType>(
+      static_cast<uintptr_t>(raw) + shared_memory_local_base);
   }
 
   inline void impl_free_in_sandbox(T_PointerType p)
   {
+    // Strip base before sending: wire carries offsets, shim adds its own
+    // base back.  NULL stays 0 on the wire.
+    uint64_t off = 0;
+    if (p != 0) {
+      off = static_cast<uint64_t>(static_cast<uintptr_t>(p) -
+                                  shared_memory_local_base);
+    }
 #if defined(RLBOX_TRANSPORT_RPCLIB)
     if (!sandbox_client) {
       return;
     }
-    sandbox_client->async_call("free", p);
+    sandbox_client->async_call("free", off);
 #elif defined(RLBOX_TRANSPORT_CAPNP)
     // Synchronous: serialized fd simplifies framing; shim's free is cheap.
     (void)capnp_call(
-      [&](wire::Request::Builder& req) { req.setRelease(static_cast<uint64_t>(p)); });
+      [&](wire::Request::Builder& req) { req.setRelease(off); });
 #endif
   }
 

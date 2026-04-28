@@ -12,21 +12,23 @@ project(rlbox_wasm_example
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Force i386 native build so host pointers match wasm2c's 32-bit offsets.
-# Must come before find_package / FetchContent so deps inherit -m32.
-# See top-level CMakeLists.txt for the full rationale.
-add_compile_options(-m32)
-add_link_options(-m32)
-message(STATUS "libjpeg-testing: forcing 32-bit (i386) build via -m32")
+# Optional whole-project i386 build (matches the top-level RLBOX_BUILD_M32
+# switch).  Off-path is the staging ground for Config B (host x86_64, shim
+# i386) -- the eventual CMake split will replace this with per-target flags.
+option(RLBOX_BUILD_M32 "Force -m32 on every native target" OFF)
+if(RLBOX_BUILD_M32)
+  add_compile_options(-m32)
+  add_link_options(-m32)
+  message(STATUS "libjpeg-testing: -m32 forced on every target")
 
-# We force -m32 above, so steer find_package(JPEG) toward the i386 multiarch
-# libdir instead of the default x86_64 one. Without this, CMake happily
-# resolves /usr/lib/x86_64-linux-gnu/libjpeg.so and the linker then errors
-# with "file in wrong format" when mixing it with our 32-bit objects.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT DEFINED JPEG_LIBRARY)
-  set(CMAKE_LIBRARY_ARCHITECTURE "i386-linux-gnu")
-  list(PREPEND CMAKE_PREFIX_PATH "/usr/lib/i386-linux-gnu")
-  set(CMAKE_FIND_ROOT_PATH "/usr/lib/i386-linux-gnu")
+  # Steer find_package(JPEG) toward the i386 multiarch libdir; otherwise CMake
+  # picks /usr/lib/x86_64-linux-gnu/libjpeg.so and the linker errors with
+  # "file in wrong format" when mixing it with 32-bit objects.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT DEFINED JPEG_LIBRARY)
+    set(CMAKE_LIBRARY_ARCHITECTURE "i386-linux-gnu")
+    list(PREPEND CMAKE_PREFIX_PATH "/usr/lib/i386-linux-gnu")
+    set(CMAKE_FIND_ROOT_PATH "/usr/lib/i386-linux-gnu")
+  endif()
 endif()
 
 find_package(JPEG REQUIRED)
@@ -418,7 +420,8 @@ add_dependencies(main_process sandbox_shim jpeg_process_wrapper)
 
 add_executable(main_adaptive
                main_adaptive.cpp
-               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp)
+               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp
+               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_meta_wasm2c_heap.c)
 target_include_directories(main_adaptive PRIVATE
                            ${rlbox_SOURCE_DIR}/code/include
                            ${rlbox_wasm2c_sandbox_SOURCE_DIR}/include
@@ -426,7 +429,14 @@ target_include_directories(main_adaptive PRIVATE
                            ${jpeg_wasm_SOURCE_DIR}
                            ${JPEG_WASM_CONFIG_DIR}
                            ${CMAKE_BINARY_DIR})
-target_link_options(main_adaptive PRIVATE "-rdynamic")
+# --wrap=*: lets the meta inject the process backend's shared memfd as wasm's
+# linear memory; the wraps delegate to upstream when no heap is pending.
+target_link_options(main_adaptive PRIVATE
+                    "-rdynamic"
+                    "LINKER:--wrap=create_wasm2c_memory"
+                    "LINKER:--wrap=destroy_wasm2c_memory"
+                    "LINKER:--wrap=wasm_rt_allocate_memory"
+                    "LINKER:--wrap=wasm_rt_free_memory")
 target_link_libraries(main_adaptive PRIVATE
                       rlbox_dynamic
                       jpeg_sandboxed

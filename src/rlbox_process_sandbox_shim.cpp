@@ -88,8 +88,15 @@ static void init_shm()
       g_shm_base = NULL;
     } else {
       g_shm_base = got;
+      // Anchor mspace at RLBOX_SHM_PROCESS_OFFSET so the low part of
+      // the region stays free for wasm's linear memory when the meta
+      // borrows this memfd as wasm's heap.  Standalone (non-meta) use
+      // pays the same partition layout for free; the wasm-reserved
+      // bytes are simply unused in that case.
+      void* mspace_base = (char*)g_shm_base + RLBOX_SHM_PROCESS_OFFSET;
       // locked=1 for thread safety between RPC server thread and library.
-      g_mspace = create_mspace_with_base(g_shm_base, g_shm_size, 1);
+      g_mspace = create_mspace_with_base(
+        mspace_base, RLBOX_SHM_PROCESS_BYTES, 1);
       init_shared_callback_keys();
     }
   }
@@ -304,13 +311,14 @@ extern "C"
 static ffi_type* ffi_type_for_tag(int32_t tag)
 {
   switch (tag) {
-    case rlbox::ARG_VOID:    return &ffi_type_void;
-    case rlbox::ARG_SINT32:  return &ffi_type_sint32;
-    case rlbox::ARG_UINT32:  return &ffi_type_uint32;
-    case rlbox::ARG_SINT64:  return &ffi_type_sint64;
-    case rlbox::ARG_UINT64:  return &ffi_type_uint64;
-    case rlbox::ARG_POINTER: return &ffi_type_pointer;
-    default:                 return nullptr;
+    case rlbox::ARG_VOID:             return &ffi_type_void;
+    case rlbox::ARG_SINT32:           return &ffi_type_sint32;
+    case rlbox::ARG_UINT32:           return &ffi_type_uint32;
+    case rlbox::ARG_SINT64:           return &ffi_type_sint64;
+    case rlbox::ARG_UINT64:           return &ffi_type_uint64;
+    case rlbox::ARG_POINTER:          return &ffi_type_pointer;
+    case rlbox::ARG_CALLBACK_HANDLE:  return &ffi_type_pointer;
+    default:                          return nullptr;
   }
 }
 
@@ -346,6 +354,14 @@ static int64_t do_ffi_call(uintptr_t func_addr,
     types[i] = t;
     arg_value_storage[i] = arg_values[i];
     if (arg_tags[i] == rlbox::ARG_POINTER) {
+      // Wire carries a 32-bit shared-region offset; reconstitute the
+      // shim-side absolute address.  NULL stays NULL.
+      uint64_t off = (uint64_t)arg_values[i];
+      void* abs = (off == 0) ? NULL : (void*)((uintptr_t)g_shm_base + off);
+      ptr_storage[i] = abs;
+      values[i] = &ptr_storage[i];
+    } else if (arg_tags[i] == rlbox::ARG_CALLBACK_HANDLE) {
+      // Callback trampoline: shim-side absolute VA, no offset arithmetic.
       ptr_storage[i] = (void*)(uintptr_t)arg_values[i];
       values[i] = &ptr_storage[i];
     } else {
@@ -381,7 +397,15 @@ static int64_t do_ffi_call(uintptr_t func_addr,
     case rlbox::ARG_SINT64:  return (int64_t)ret_buf;
     case rlbox::ARG_UINT64:  return (int64_t)(uint64_t)ret_buf;
     case rlbox::ARG_POINTER: {
-      // Pointer returns flow back as absolute addresses (same-base mapping).
+      // Data pointer return: send a 32-bit shared-region offset.
+      void* p = *(void**)&ret_buf;
+      if (!p) {
+        return 0;
+      }
+      return (int64_t)((uintptr_t)p - (uintptr_t)g_shm_base);
+    }
+    case rlbox::ARG_CALLBACK_HANDLE: {
+      // Function pointer return (rare): pass shim-side absolute VA.
       void* p = *(void**)&ret_buf;
       return (int64_t)(uintptr_t)p;
     }
@@ -616,8 +640,9 @@ static uintptr_t handle_lookup_symbol(const char* name)
 
 // Reject pointers outside the shared region: dlmalloc with HAVE_MMAP
 // can satisfy huge requests outside the mspace, which the host can't
-// reach. Returns the absolute address.
-static uintptr_t handle_allocate(size_t size)
+// reach. Returns a 32-bit offset into the shared region (0 = failure /
+// NULL); host adds its base back so its T_PointerType stays an absolute VA.
+static uint64_t handle_allocate(size_t size)
 {
   void* ptr = malloc(size);
   if (!ptr || !g_shm_base) {
@@ -629,14 +654,17 @@ static uintptr_t handle_allocate(size_t size)
     free(ptr);
     return 0;
   }
-  return p;
+  return (uint64_t)(p - base);
 }
 
-static void handle_release(uintptr_t abs_addr)
+// Wire carries a shared-region offset; reconstitute the shim-side
+// absolute address before handing back to free().
+static void handle_release(uint64_t offset)
 {
-  if (abs_addr != 0) {
-    free((void*)abs_addr);
+  if (offset == 0 || !g_shm_base) {
+    return;
   }
+  free((void*)((uintptr_t)g_shm_base + offset));
 }
 
 // Try a pre-forked worker; fall back to inline fork on empty/disabled
@@ -751,7 +779,7 @@ static void start_rpc_server()
     return handle_lookup_symbol(name.c_str());
   });
   srv.bind("malloc", [](size_t size) { return handle_allocate(size); });
-  srv.bind("free", [](uintptr_t abs_addr) { handle_release(abs_addr); });
+  srv.bind("free", [](uint64_t offset) { handle_release(offset); });
   srv.bind("invoke",
            [](uintptr_t func_addr,
               int32_t ret_tag,

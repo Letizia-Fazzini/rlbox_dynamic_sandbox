@@ -66,10 +66,13 @@ int main(int argc, char const *argv[]) {
       int row_stride = image_width * image_channels;
 
       //set up output buffer pointers inside sandbox.  We pre-allocate the
-      //JPEG output buffer ourselves (so it goes through meta's
-      //malloc_in_sandbox and is therefore tagged in alloc_owner) and pass
-      //TJFLAG_NOREALLOC so libjpeg-turbo won't replace it with an internal
-      //tjAlloc'd (untagged) buffer that copy_and_verify_range can't translate.
+      //JPEG output buffer ourselves and pass TJFLAG_NOREALLOC so
+      //libjpeg-turbo won't replace it via an internal tjAlloc.  Reason:
+      //meta's T_PointerType is uintptr_t (inherited from process), so the
+      //*outBuffer slot in shared memory is 8 bytes wide.  A host-side
+      //store writes the full host VA; a wasm-side store from an internal
+      //tjAlloc only writes 4 bytes (wasm pointer width), leaving the high
+      //4 bytes stale and breaking the host's later copy_and_verify_range.
       auto maxSize = sandbox.invoke_sandbox_function(tjBufSize, image_width, image_height, TJSAMP_444);
       auto verifiedMaxSize = maxSize.copy_and_verify([](unsigned long ret) {
         release_assert(ret != 0, "max size cannot be 0");

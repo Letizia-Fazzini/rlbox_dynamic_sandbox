@@ -11,23 +11,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Force a 32-bit (i386) build of every native target in this project.
-#
-# Rationale: the wasm2c backend hands out 32-bit linear-memory offsets, and
-# rlbox_meta_sandbox encodes the owning backend in the *high* bit of
-# T_PointerType.  When the host is 64-bit and the wasm side is 32-bit the
-# two address spaces have different widths, which complicates struct
-# marshaling and the bit-tag scheme.  Building everything as i386 makes
-# host pointers 4 bytes wide so they line up exactly with the wasm side.
-#
-# These options are set BEFORE any FetchContent_MakeAvailable so that
-# rpclib / Cap'n Proto / Catch2 / rlbox subprojects inherit the flag and
-# get rebuilt with -m32 from source (system 32-bit packages are not
-# required for them).  System-level i386 dev libs are still required for
-# libffi / libjpeg-turbo / zlib (e.g. apt install libffi-dev:i386 ...).
-add_compile_options(-m32)
-add_link_options(-m32)
-message(STATUS "rlbox_dynamic: forcing 32-bit (i386) build via -m32")
+# Whole-project i386 build.  Off by default; turn on to compile every TU
+# (host + shim + FetchContent deps) with -m32.  Off-path is the staging
+# ground for Config B (host x86_64, shim i386) -- per-target flags will
+# eventually replace this when the build is split.
+option(RLBOX_BUILD_M32 "Force -m32 on every native target" OFF)
+if(RLBOX_BUILD_M32)
+  add_compile_options(-m32)
+  add_link_options(-m32)
+  message(STATUS "rlbox_dynamic: -m32 forced on every target")
+endif()
 
 option(RLBOX_DYNAMIC_BUILD_TESTS "Build unit + integration tests" ON)
 
@@ -71,6 +64,31 @@ else()
           "RLBOX_SECCOMP must be 'off', 'audit', or 'enforce', got '${RLBOX_SECCOMP}'")
 endif()
 message(STATUS "rlbox_dynamic seccomp: ${RLBOX_SECCOMP}")
+
+# Meta-sandbox adaptive policy mode ###################
+#
+# Default backend-selection strategy returned by make_adaptive_policy().
+# global       -- one current_best across all symbols, updated from per-backend
+#                 median sums (current behavior).
+# per_function -- each symbol decides independently from its own latency rings.
+# Embedders that want explicit control can call make_adaptive_global_policy or
+# make_adaptive_per_function_policy directly regardless of this setting.
+set(RLBOX_META_ADAPTIVE_MODE "global" CACHE STRING
+    "Default for make_adaptive_policy: global | per_function")
+set_property(CACHE RLBOX_META_ADAPTIVE_MODE PROPERTY STRINGS global per_function)
+
+if(NOT RLBOX_META_ADAPTIVE_MODE STREQUAL "global" AND
+   NOT RLBOX_META_ADAPTIVE_MODE STREQUAL "per_function")
+  message(FATAL_ERROR
+          "RLBOX_META_ADAPTIVE_MODE must be 'global' or 'per_function', got '${RLBOX_META_ADAPTIVE_MODE}'")
+endif()
+message(STATUS "rlbox_dynamic meta adaptive mode: ${RLBOX_META_ADAPTIVE_MODE}")
+
+# Phase 7c shim arch.  Declared early so rlbox_dynamic INTERFACE defs and the
+# downstream sub-build block can both read it.
+set(RLBOX_PROCESS_SHIM_ARCH "host" CACHE STRING
+    "Arch for sandbox_shim.so + process_sandbox_wrapper: host | i386")
+set_property(CACHE RLBOX_PROCESS_SHIM_ARCH PROPERTY STRINGS host i386)
 
 # Dependencies ###################
 
@@ -181,6 +199,17 @@ else()
   target_link_libraries(rlbox_dynamic INTERFACE rlbox_capnp_schema)
   target_compile_definitions(rlbox_dynamic INTERFACE RLBOX_TRANSPORT_CAPNP=1)
 endif()
+if(RLBOX_META_ADAPTIVE_MODE STREQUAL "per_function")
+  target_compile_definitions(rlbox_dynamic INTERFACE RLBOX_META_ADAPTIVE_PER_FUNCTION=1)
+endif()
+
+# Contract macro: tells the host-side process backend whether the shim is
+# 32-bit or 64-bit, so wire encodings can size pointers/longs accordingly.
+if(RLBOX_PROCESS_SHIM_ARCH STREQUAL "i386")
+  target_compile_definitions(rlbox_dynamic INTERFACE RLBOX_PROCESS_SHIM_TARGET_BITS=32)
+else()
+  target_compile_definitions(rlbox_dynamic INTERFACE RLBOX_PROCESS_SHIM_TARGET_BITS=64)
+endif()
 
 # --- Sandbox shim (LD_PRELOADed into the child process) ---
 #
@@ -197,7 +226,7 @@ set(DLMALLOC_SOURCE "" CACHE FILEPATH
     "Path to dlmalloc malloc.c.  If empty, downloaded from Doug Lea's site.")
 
 if(NOT DLMALLOC_SOURCE)
-  set(DLMALLOC_SOURCE "${CMAKE_BINARY_DIR}/third_party/dlmalloc/malloc.c")
+  set(DLMALLOC_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/third_party/dlmalloc/malloc.c")
   if(NOT EXISTS "${DLMALLOC_SOURCE}")
     message(STATUS "Downloading dlmalloc from ${DLMALLOC_DEFAULT_URL}")
     file(DOWNLOAD
@@ -255,6 +284,62 @@ set_target_properties(sandbox_shim PROPERTIES
 
 # --- Stock process wrapper (no test glue) ---
 add_executable(process_sandbox_wrapper c_src/process_sandbox_wrapper.c)
+
+# --- Phase 7c: i386 shim sub-build ---
+#
+# When RLBOX_PROCESS_SHIM_ARCH=i386, build sandbox_shim.so + the generic
+# wrapper as a 32-bit ELF in a separate ExternalProject subtree.  Host
+# x86_64 targets continue to be built here unchanged; consumer paths
+# (test_process_sandbox, per-library wrappers) flip to consume the i386
+# outputs in a follow-up stage.
+#
+# The sub-build's source tree is shim_i386/CMakeLists.txt.  It re-fetches
+# Cap'n Proto (i386 build) but reuses the host's pre-generated capnp
+# schema source (the schema is arch-independent C++) and the host's
+# already-downloaded dlmalloc malloc.c.
+
+if(RLBOX_PROCESS_SHIM_ARCH STREQUAL "i386")
+  include(ExternalProject)
+  set(_shim_i386_binary_dir ${CMAKE_BINARY_DIR}/shim_i386_build)
+
+  # The sub-build needs the host's capnp-generated .c++ to already exist on
+  # disk before it configures (it skips re-running the schema compiler).
+  ExternalProject_Add(shim_i386_subbuild
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shim_i386
+    BINARY_DIR ${_shim_i386_binary_dir}
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+      -DRLBOX_PARENT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -DRLBOX_PARENT_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+      -DRLBOX_TRANSPORT=${RLBOX_TRANSPORT}
+      -DRLBOX_SECCOMP_MODE=${_rlbox_seccomp_mode}
+    BUILD_ALWAYS 1
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS
+      ${_shim_i386_binary_dir}/sandbox_shim.so
+      ${_shim_i386_binary_dir}/process_sandbox_wrapper
+      ${_shim_i386_binary_dir}/zlib_process_wrapper)
+  if(RLBOX_TRANSPORT STREQUAL "capnp")
+    add_dependencies(shim_i386_subbuild rlbox_capnp_schema)
+  endif()
+
+  # Expose the sub-build's outputs as imported targets so the rest of the
+  # build can depend on them via $<TARGET_FILE:...> and add_dependencies.
+  add_library(sandbox_shim_i386 SHARED IMPORTED GLOBAL)
+  set_target_properties(sandbox_shim_i386 PROPERTIES
+                        IMPORTED_LOCATION ${_shim_i386_binary_dir}/sandbox_shim.so)
+  add_dependencies(sandbox_shim_i386 shim_i386_subbuild)
+
+  add_executable(process_sandbox_wrapper_i386 IMPORTED GLOBAL)
+  set_target_properties(process_sandbox_wrapper_i386 PROPERTIES
+                        IMPORTED_LOCATION ${_shim_i386_binary_dir}/process_sandbox_wrapper)
+  add_dependencies(process_sandbox_wrapper_i386 shim_i386_subbuild)
+
+  add_executable(zlib_process_wrapper_i386 IMPORTED GLOBAL)
+  set_target_properties(zlib_process_wrapper_i386 PROPERTIES
+                        IMPORTED_LOCATION ${_shim_i386_binary_dir}/zlib_process_wrapper)
+  add_dependencies(zlib_process_wrapper_i386 shim_i386_subbuild)
+endif()
 
 # --- Tests ###################
 

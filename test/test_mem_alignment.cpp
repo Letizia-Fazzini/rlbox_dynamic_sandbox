@@ -41,11 +41,12 @@ TEST_CASE("os_mmap_aligned produces 2MB alignment", "[mem][alignment]")
   munmap(p, kOneMB);
 }
 
-TEST_CASE("os_mmap_aligned produces 4GB alignment (matches sandbox config)",
+TEST_CASE("os_mmap_aligned produces 4GB alignment",
           "[mem][alignment]")
 {
-  // 4GB is the alignment used in impl_create_sandbox; pointer translation
-  // depends on this invariant.
+  // Property test of the alignment helper. impl_create_sandbox uses
+  // 1-GiB-aligned hint slots in low 4 GiB so an i386 shim can mmap the same
+  // VA, but the helper itself must still honor 4-GiB requests correctly.
   void* p = os_mmap_aligned(kOneMB, kFourGB);
   REQUIRE(p != nullptr);
   REQUIRE(is_aligned(p, kFourGB));

@@ -12,12 +12,15 @@ project(rlbox_wasm_example
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Force i386 native build so host pointers match wasm2c's 32-bit offsets.
-# Must come before find_package / FetchContent so deps inherit -m32.
-# See top-level CMakeLists.txt for the full rationale.
-add_compile_options(-m32)
-add_link_options(-m32)
-message(STATUS "zlib-testing: forcing 32-bit (i386) build via -m32")
+# Optional whole-project i386 build (matches the top-level RLBOX_BUILD_M32
+# switch).  Off-path is the staging ground for Config B (host x86_64, shim
+# i386) -- the eventual CMake split will replace this with per-target flags.
+option(RLBOX_BUILD_M32 "Force -m32 on every native target" OFF)
+if(RLBOX_BUILD_M32)
+  add_compile_options(-m32)
+  add_link_options(-m32)
+  message(STATUS "zlib-testing: -m32 forced on every target")
+endif()
 
 find_package(ZLIB REQUIRED)
 
@@ -179,7 +182,7 @@ target_link_libraries(main zlib_sandboxed pthread ZLIB::ZLIB)
 # One-shot "stress" variant: one deflate(Z_FINISH) invoke over the whole
 # stream. Amortizes per-call overhead -- the companion to main_process_stress
 # so process fork() cost is paid once per compression.
-add_executable(main_stress main_stress.cpp)
+add_executable(main_stress main_oneshot.cpp)
 target_include_directories(main_stress PUBLIC ${rlbox_SOURCE_DIR}/code/include
                                        PUBLIC ${rlbox_wasm2c_sandbox_SOURCE_DIR}/include
                                        PUBLIC ${zlib_wasm_SOURCE_DIR})
@@ -200,11 +203,30 @@ add_subdirectory(${RLBOX_DYNAMIC_ROOT} rlbox_dynamic_parent EXCLUDE_FROM_ALL)
 # the linker from pruning zlib's externally-referenced symbols, and the
 # zlib_wrapper.c file contributes deflateInitWrapper / inflateInitWrapper
 # so we can call the deflateInit_ macro from the host side.
-add_executable(zlib_process_wrapper
-               ${RLBOX_DYNAMIC_ROOT}/c_src/process_sandbox_wrapper.c
-               ${CMAKE_CURRENT_SOURCE_DIR}/zlib_wrapper.c)
-target_link_libraries(zlib_process_wrapper PRIVATE ZLIB::ZLIB)
-target_link_options(zlib_process_wrapper PRIVATE "-rdynamic")
+#
+# Under RLBOX_PROCESS_SHIM_ARCH=i386 the wrapper is built i386 by the
+# parent ExternalProject (target zlib_process_wrapper_i386, IMPORTED).
+if(NOT RLBOX_PROCESS_SHIM_ARCH STREQUAL "i386")
+  add_executable(zlib_process_wrapper
+                 ${RLBOX_DYNAMIC_ROOT}/c_src/process_sandbox_wrapper.c
+                 ${CMAKE_CURRENT_SOURCE_DIR}/zlib_wrapper.c)
+  target_link_libraries(zlib_process_wrapper PRIVATE ZLIB::ZLIB)
+  target_link_options(zlib_process_wrapper PRIVATE "-rdynamic")
+endif()
+
+# Wrapper path + shim file expressions used by every host-side consumer
+# below.  Switch them to the imported i386 targets when configured.
+if(RLBOX_PROCESS_SHIM_ARCH STREQUAL "i386")
+  set(_rlbox_zlib_wrapper_target zlib_process_wrapper_i386)
+  set(_rlbox_zlib_wrapper_path $<TARGET_FILE:zlib_process_wrapper_i386>)
+  set(_rlbox_shim_target sandbox_shim_i386)
+  set(_rlbox_shim_path $<TARGET_FILE:sandbox_shim_i386>)
+else()
+  set(_rlbox_zlib_wrapper_target zlib_process_wrapper)
+  set(_rlbox_zlib_wrapper_path $<TARGET_FILE:zlib_process_wrapper>)
+  set(_rlbox_shim_target sandbox_shim)
+  set(_rlbox_shim_path $<TARGET_FILE:sandbox_shim>)
+endif()
 
 # Host-side main that uses the process sandbox.  The sandbox hard-codes
 # LD_PRELOAD="./sandbox_shim.so" relative to CWD, so we copy the shim
@@ -220,21 +242,21 @@ target_link_libraries(main_process PRIVATE
                       pthread
                       ZLIB::ZLIB)
 target_compile_definitions(main_process PRIVATE
-  ZLIB_PROCESS_WRAPPER_PATH="$<TARGET_FILE:zlib_process_wrapper>")
+  ZLIB_PROCESS_WRAPPER_PATH="${_rlbox_zlib_wrapper_path}")
 
 add_custom_command(TARGET main_process POST_BUILD
                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                           $<TARGET_FILE:sandbox_shim>
+                           ${_rlbox_shim_path}
                            $<TARGET_FILE_DIR:main_process>/sandbox_shim.so
-                   DEPENDS sandbox_shim)
-add_dependencies(main_process sandbox_shim zlib_process_wrapper)
+                   DEPENDS ${_rlbox_shim_target})
+add_dependencies(main_process ${_rlbox_shim_target} ${_rlbox_zlib_wrapper_target})
 
 
 add_executable(bench_native ${CMAKE_CURRENT_SOURCE_DIR}/bench_native.cpp)
 
 # Process-backed "stress" variant -- one deflate invoke per stream.
 add_executable(main_process_stress
-               main_process_stress.cpp
+               main_process_oneshot.cpp
                ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp)
 target_include_directories(main_process_stress PRIVATE
                            ${rlbox_SOURCE_DIR}/code/include
@@ -244,16 +266,14 @@ target_link_libraries(main_process_stress PRIVATE
                       pthread
                       ZLIB::ZLIB)
 target_compile_definitions(main_process_stress PRIVATE
-  ZLIB_PROCESS_WRAPPER_PATH="$<TARGET_FILE:zlib_process_wrapper>")
+  ZLIB_PROCESS_WRAPPER_PATH="${_rlbox_zlib_wrapper_path}")
 
 add_custom_command(TARGET main_process_stress POST_BUILD
                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                           $<TARGET_FILE:sandbox_shim>
+                           ${_rlbox_shim_path}
                            $<TARGET_FILE_DIR:main_process_stress>/sandbox_shim.so
-                   DEPENDS sandbox_shim)
-add_dependencies(main_process_stress sandbox_shim zlib_process_wrapper)
-
-add_executable(bench_native ${CMAKE_CURRENT_SOURCE_DIR}/bench_native.c)
+                   DEPENDS ${_rlbox_shim_target})
+add_dependencies(main_process_stress ${_rlbox_shim_target} ${_rlbox_zlib_wrapper_target})
 
 target_link_libraries(bench_native pthread ZLIB::ZLIB)
 
@@ -264,29 +284,86 @@ target_link_libraries(bench_native pthread ZLIB::ZLIB)
 # policy: process, wasm, or adaptive.
 
 add_executable(main_meta
-               main_meta.cpp
-               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp)
+               main_adaptive.cpp
+               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp
+               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_meta_wasm2c_heap.c)
 target_include_directories(main_meta PRIVATE
                            ${rlbox_SOURCE_DIR}/code/include
                            ${rlbox_wasm2c_sandbox_SOURCE_DIR}/include
                            ${RLBOX_DYNAMIC_ROOT}/include
                            ${zlib_wasm_SOURCE_DIR}
                            ${CMAKE_BINARY_DIR})
-# -rdynamic is required so the wasm2c-generated `w2c_<module>_<fn>` thunks
-# are exported in the dynamic symbol table for the meta's runtime
-# dlsym(RTLD_DEFAULT, ...) resolution.  See the M3 design note.
-target_link_options(main_meta PRIVATE "-rdynamic")
+# -rdynamic: wasm2c thunks must be in the dynamic symtab for meta's dlsym.
+# --wrap=wasm_rt_allocate_memory et al: lets the meta inject the process
+# backend's shared memfd as wasm's linear memory; the wraps delegate to
+# upstream when no heap is pending, so non-shared paths are byte-identical.
+target_link_options(main_meta PRIVATE
+                    "-rdynamic"
+                    "LINKER:--wrap=create_wasm2c_memory"
+                    "LINKER:--wrap=destroy_wasm2c_memory"
+                    "LINKER:--wrap=wasm_rt_allocate_memory"
+                    "LINKER:--wrap=wasm_rt_free_memory")
 target_link_libraries(main_meta PRIVATE
                       rlbox_dynamic
                       zlib_sandboxed
                       pthread
                       ZLIB::ZLIB)
 target_compile_definitions(main_meta PRIVATE
-  ZLIB_PROCESS_WRAPPER_PATH="$<TARGET_FILE:zlib_process_wrapper>")
+  ZLIB_PROCESS_WRAPPER_PATH="${_rlbox_zlib_wrapper_path}")
 
 add_custom_command(TARGET main_meta POST_BUILD
                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                           $<TARGET_FILE:sandbox_shim>
+                           ${_rlbox_shim_path}
                            $<TARGET_FILE_DIR:main_meta>/sandbox_shim.so
-                   DEPENDS sandbox_shim)
-add_dependencies(main_meta sandbox_shim zlib_process_wrapper)
+                   DEPENDS ${_rlbox_shim_target})
+add_dependencies(main_meta ${_rlbox_shim_target} ${_rlbox_zlib_wrapper_target})
+
+# Cross-backend pointer integration test: mints a buffer through one
+# backend's allocator and checksums it via the other backend's invoke path.
+add_executable(test_cross_pointer
+               test_cross_pointer.cpp
+               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_process_tls.cpp
+               ${RLBOX_DYNAMIC_ROOT}/src/rlbox_meta_wasm2c_heap.c)
+target_include_directories(test_cross_pointer PRIVATE
+                           ${rlbox_SOURCE_DIR}/code/include
+                           ${rlbox_wasm2c_sandbox_SOURCE_DIR}/include
+                           ${RLBOX_DYNAMIC_ROOT}/include
+                           ${zlib_wasm_SOURCE_DIR}
+                           ${CMAKE_BINARY_DIR})
+target_link_options(test_cross_pointer PRIVATE
+                    "-rdynamic"
+                    "LINKER:--wrap=create_wasm2c_memory"
+                    "LINKER:--wrap=destroy_wasm2c_memory"
+                    "LINKER:--wrap=wasm_rt_allocate_memory"
+                    "LINKER:--wrap=wasm_rt_free_memory")
+target_link_libraries(test_cross_pointer PRIVATE
+                      rlbox_dynamic
+                      zlib_sandboxed
+                      pthread
+                      ZLIB::ZLIB)
+target_compile_definitions(test_cross_pointer PRIVATE
+  ZLIB_PROCESS_WRAPPER_PATH="${_rlbox_zlib_wrapper_path}")
+
+add_custom_command(TARGET test_cross_pointer POST_BUILD
+                   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                           ${_rlbox_shim_path}
+                           $<TARGET_FILE_DIR:test_cross_pointer>/sandbox_shim.so
+                   DEPENDS ${_rlbox_shim_target})
+add_dependencies(test_cross_pointer ${_rlbox_shim_target} ${_rlbox_zlib_wrapper_target})
+
+# Pure-policy unit tests for make_adaptive_*_policy.  Includes the meta
+# header but never instantiates a sandbox -- runs synthetic
+# meta_policy_context values through the policy closures directly.  Skips
+# the heap-injection wrap and process-tls TUs that only matter when an
+# actual sandbox is brought up.
+add_executable(test_meta_policy test_meta_policy.cpp)
+target_include_directories(test_meta_policy PRIVATE
+                           ${rlbox_SOURCE_DIR}/code/include
+                           ${rlbox_wasm2c_sandbox_SOURCE_DIR}/include
+                           ${RLBOX_DYNAMIC_ROOT}/include
+                           ${zlib_wasm_SOURCE_DIR}
+                           ${CMAKE_BINARY_DIR})
+target_link_libraries(test_meta_policy PRIVATE
+                      rlbox_dynamic
+                      zlib_sandboxed
+                      pthread)
