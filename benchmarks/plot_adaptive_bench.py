@@ -118,7 +118,7 @@ def plot_overhead_per_level(
     if not sandbox_backends:
         return
 
-    group_labels = [human_size(s) for s in sizes] + ["avg"]
+    group_labels = [f"{human_size(s).lower()}-phase" for s in sizes] + ["Overall"]
     x = np.arange(len(group_labels))
     width = 0.8 / max(1, len(sandbox_backends))
 

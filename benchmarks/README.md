@@ -2,7 +2,7 @@
 
 This directory contains the benchmark drivers and plotting scripts used to
 measure the overhead of the different RLBox sandboxing backends on real
-workloads (zlib compression and libjpeg JPEG encoding).
+workloads (libjpeg JPEG encoding).
 
 There are two independent benchmark suites:
 
@@ -14,21 +14,19 @@ There are two independent benchmark suites:
 Both drivers write a CSV to [results.csv](results.csv) (override with `--out`)
 and the plotters render PNGs into [plots/](plots/).
 
-Both drivers support `--library {jpeg,zlib}` (default: `jpeg`). For zlib the
-`--levels` flag is the compression level (1-9, higher = more compression);
-for jpeg it is the quality value (1-100, higher = LESS compression). Default
-levels are `90,50,25,10` for jpeg and `1,6,9` for zlib. Sizes are passed via
+The `--levels` flag is the JPEG quality value (1-100, higher = LESS
+compression). The default levels are `90,50,25,10`. Sizes are passed via
 `--sizes` and accept `k`/`m` suffixes (e.g. `--sizes 5k,250k,1m`).
 
 ---
 
 ## `run_process_bench.py` — comparing transports
 
-This driver expects **three separate build directories** under the library's
+This driver expects **three separate build directories** under the libjpeg
 testing folder, one per transport, because the rpclib and capnp
 configurations are mutually exclusive at CMake-configure time.
 
-For libjpeg, run from inside [test/libjpeg-testing/](../test/libjpeg-testing/):
+Run from inside [test/libjpeg-testing/](../test/libjpeg-testing/):
 
 ```bash
 # wasm2c backend (also builds bench_native, used as the reference)
@@ -44,12 +42,10 @@ cmake -DCMAKE_BUILD_TYPE=Release -DRLBOX_TRANSPORT=capnp  -S . -B build_capnp
 cmake --build build_capnp  --parallel
 ```
 
-The same pattern applies for zlib in [test/zlib-testing/](../test/zlib-testing/).
-
 After building, run the driver from this directory:
 
 ```bash
-./run_process_bench.py --library jpeg --sizes 5k,50k,250k --iters 5
+./run_process_bench.py --sizes 5k,50k,250k --iters 5
 ./plot_process_bench.py
 ```
 
@@ -69,20 +65,19 @@ produces exactly one `COMPRESSION_MS=` measurement. The script also
 temporarily replaces the `test_data/` directory in each build dir with a
 single resized input file and restores the original contents on exit.
 
-The plotter writes one `overhead_q{level}.png` per quality/compression level,
-showing slowdown of each sandbox backend versus `native`.
+The plotter writes one `overhead_q{level}.png` per quality level, showing
+slowdown of each sandbox backend versus `native`.
 
 ---
 
 ## `run_adaptive_bench.py` — comparing the adaptive meta-sandbox
 
-This driver expects **a single build directory** (`build/`) per library that
-contains all four binaries (`bench_native`, `main`, `main_process`,
-`main_adaptive`) plus `sandbox_shim.so`. The transport for the process and
-adaptive backends is whatever was selected at CMake-configure time.
+This driver expects **a single build directory** (`build/`) that contains all
+four binaries (`bench_native`, `main`, `main_process`, `main_adaptive`) plus
+`sandbox_shim.so`. The transport for the process and adaptive backends is
+whatever was selected at CMake-configure time.
 
-From inside [test/libjpeg-testing/](../test/libjpeg-testing/) (or
-[test/zlib-testing/](../test/zlib-testing/)):
+From inside [test/libjpeg-testing/](../test/libjpeg-testing/):
 
 ```bash
 # default transport (capnp)
@@ -97,7 +92,7 @@ cmake --build build --parallel
 Then run from this directory:
 
 ```bash
-./run_adaptive_bench.py --library jpeg --sizes 5k,50k,250k --iters 5 --inner-iters 10
+./run_adaptive_bench.py --sizes 5k,50k,250k --iters 5 --inner-iters 10
 ./plot_adaptive_bench.py
 ```
 
