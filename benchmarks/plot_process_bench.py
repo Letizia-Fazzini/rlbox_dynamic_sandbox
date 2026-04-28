@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Produce overhead plots from run_process_bench.py's results.csv.
+Produce overhead plot from run_process_bench.py's results.csv.
 
 Generates:
-    overhead_q{level}.png  -- one per quality/compression level: grouped bars,
-                              one group per size, one bar per sandbox backend
-                              (wasm2c, process_rpclib, process_capnp, ...);
-                              y is slowdown vs native.
-
-Unlike plot_adaptive_bench.py there is no per-level "avg" group and no
-overall-across-sizes chart; this script only renders one chart per level.
+    overhead.png  -- a single figure with one subplot per quality/compression
+                     level. Each subplot has grouped bars: one group per size,
+                     one bar per sandbox backend (wasm2c, process_rpclib,
+                     process_capnp, ...); y is slowdown vs native.
 """
 from __future__ import annotations
 
@@ -99,46 +96,62 @@ def human_size(n: int) -> str:
     return str(n)
 
 
-def plot_overhead_per_level(
-    rows: list[dict], meds: dict, level: int, sizes: list[int], out_path: Path
+def plot_overhead_combined(
+    rows: list[dict], meds: dict, levels: list[int], sizes: list[int], out_path: Path
 ) -> None:
-    """One chart for a single quality/compression level.
+    """Single figure with one subplot per level.
 
-    X groups: each size.  Bars within a group: one per sandbox backend,
-    showing slowdown relative to native at that (level, size).
+    Each subplot: x groups are sizes, bars within a group are sandbox backends,
+    y is slowdown vs native at that (level, size).
     """
     sandbox_backends = [b for b in order_backends(rows) if b != "native"]
-    if not sandbox_backends:
+    if not sandbox_backends or not levels:
         return
 
     group_labels = [human_size(s) for s in sizes]
     x = np.arange(len(group_labels))
     width = 0.8 / max(1, len(sandbox_backends))
 
-    fig, ax = plt.subplots(figsize=(6, 4.2))
-    for i, backend in enumerate(sandbox_backends):
-        ratios = []
-        for s in sizes:
-            sbx = meds.get((backend, level, s))
-            nat = meds.get(("native", level, s))
-            ratios.append(sbx / nat if (sbx and nat) else 0.0)
-        offset = (i - (len(sandbox_backends) - 1) / 2) * width
-        ax.bar(
-            x + offset,
-            ratios,
-            width,
-            label=label_for(backend),
-            color=color_for(backend, i),
-        )
-    ax.axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.5)
-    ax.set_xticks(x)
-    ax.set_xticklabels(group_labels)
-    ax.set_xlabel("input size (bytes)")
-    ax.set_ylabel("slowdown vs native (x)")
-    ax.grid(True, axis="y", linestyle=":", alpha=0.5)
-    ax.legend(loc="best")
-    fig.suptitle(f"sandbox overhead vs native - level {level}")
-    fig.tight_layout()
+    n = len(levels)
+    ncols = min(n, 2)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(6 * ncols, 4.2 * nrows), squeeze=False
+    )
+
+    for idx, level in enumerate(levels):
+        ax = axes[idx // ncols][idx % ncols]
+        for i, backend in enumerate(sandbox_backends):
+            ratios = []
+            for s in sizes:
+                sbx = meds.get((backend, level, s))
+                nat = meds.get(("native", level, s))
+                ratios.append(sbx / nat if (sbx and nat) else 0.0)
+            offset = (i - (len(sandbox_backends) - 1) / 2) * width
+            ax.bar(
+                x + offset,
+                ratios,
+                width,
+                label=label_for(backend),
+                color=color_for(backend, i),
+            )
+        ax.axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(group_labels)
+        ax.set_xlabel("input size (bytes)")
+        ax.set_ylabel("slowdown vs native (x)")
+        ax.set_title(f"level {level}")
+        ax.grid(True, axis="y", linestyle=":", alpha=0.5)
+
+    # Hide any unused axes.
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].axis("off")
+
+    # Single legend for the whole figure.
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(labels))
+    fig.suptitle("sandbox overhead vs native")
+    fig.tight_layout(rect=[0, 0.05, 1, 0.97])
     fig.savefig(out_path, dpi=130)
     plt.close(fig)
     print(f"[plot] wrote {out_path}")
@@ -164,10 +177,7 @@ def main() -> int:
     levels = sorted({r["level"] for r in rows})
     sizes = sorted({r["size"] for r in rows})
 
-    for lvl in levels:
-        plot_overhead_per_level(
-            rows, meds, lvl, sizes, args.out_dir / f"overhead_q{lvl}.png"
-        )
+    plot_overhead_combined(rows, meds, levels, sizes, args.out_dir / "overhead.png")
     return 0
 
 

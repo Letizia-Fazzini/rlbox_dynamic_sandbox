@@ -1,6 +1,6 @@
-// One-shot zlib compression via wasm2c: read the whole input, allocate a
-// single sandbox input buffer + a compressBound()-sized output buffer,
-// and call deflate(Z_FINISH) exactly once.
+// One-shot zlib compression via rlbox_process_sandbox. Read the entire
+// input, allocate one sandbox input + one compressBound()-sized output,
+// invoke deflate(Z_FINISH) once.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,19 +18,16 @@ static double monotonic_ms()
 #define release_assert(cond, msg) if (!(cond)) { fputs(msg "\n", stderr); abort(); }
 
 #define RLBOX_SINGLE_THREADED_INVOCATIONS
-#define RLBOX_USE_STATIC_CALLS() rlbox_wasm2c_sandbox_lookup_symbol
-#define RLBOX_WASM2C_MODULE_NAME zlib
 
-#include "zlib.wasm.h"
 #include "rlbox.hpp"
-#include "rlbox_wasm2c_sandbox.hpp"
+#include "rlbox_process_sandbox.hpp"
 #include "zlib.h"
 #include "zlib_structs.h"
 
 using namespace rlbox;
 
 rlbox_load_structs_from_library(zlib);
-RLBOX_DEFINE_BASE_TYPES_FOR(zlib, wasm2c);
+RLBOX_DEFINE_BASE_TYPES_FOR(zlib, process);
 
 extern "C" {
   int deflateInitWrapper(z_streamp strm, int level);
@@ -41,9 +38,9 @@ int main(int argc, char const *argv[]) {
   if (argc > 1) level = std::stoi(argv[1]);
 
   rlbox_sandbox_zlib sandbox;
-  sandbox.create_sandbox();
+  sandbox.create_sandbox(ZLIB_PROCESS_WRAPPER_PATH);
 
-  FILE* source = fopen("pi.txt", "r");
+  FILE* source = fopen("test_data.txt", "r");
   FILE* dest   = fopen("compressed.txt", "w");
   release_assert(source && dest, "could not open pi.txt / compressed.txt");
 
@@ -71,7 +68,6 @@ int main(int argc, char const *argv[]) {
   });
   if (verifiedInit != Z_OK) return Z_ERRNO;
 
-  // Worst-case output from host libz; no sandbox crossing.
   size_t out_cap = compressBound((uLong)in_size);
 
   double t0 = monotonic_ms();

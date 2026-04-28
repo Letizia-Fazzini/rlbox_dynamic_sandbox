@@ -13,14 +13,15 @@ A process-isolation backend for [RLBox](https://github.com/PLSysSec/rlbox). Each
 | `include/rlbox_process_mem.hpp`, `include/rlbox_process_tls.hpp`, `src/rlbox_process_tls.cpp` | Shared-memory allocator + thread-local sandbox pointer used by RLBox's `_no_ctx` helpers. |
 | `test/test_*.cpp` | Unit + integration tests for pointer ops, memory alignment, and end-to-end invoke/callback paths. |
 | `test/zlib-testing/` | End-to-end zlib port. `main.cpp` runs under wasm2c, `main_process.cpp` runs under the process backend. |
-| `bench/` | Benchmark harness comparing native, wasm2c, and process backends on zlib. |
+| `benchmarks/` | Benchmark harness comparing native, wasm2c, and process backends on zlib. |
 
 ## Building and running the tests
+
+For information on running the tests refer to the README.md within the `/benchmarks` directory. For general build instructions:
 
 ```bash
 cmake -S . -B ./build
 cmake --build ./build --parallel
-cmake --build ./build --target test
 ```
 
 The host<->shim wire protocol is selectable at configure time:
@@ -37,4 +38,5 @@ Dev build (warnings-as-errors, address sanitizer, clang-tidy if installed):
 ```bash
 cmake -DCMAKE_BUILD_TYPE=Debug -DDEV=ON -S . -B ./build
 ```
+
 

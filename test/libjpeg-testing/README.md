@@ -1,1 +1,0 @@
-This example is described [here](https://rlbox.dev/chapters/wasm-sandbox.html).

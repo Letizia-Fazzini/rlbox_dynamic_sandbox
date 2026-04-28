@@ -82,7 +82,7 @@ int main(int argc, char const* argv[]) {
     return 2;
   }
 
-  FILE* source = fopen("pi.txt", "r");
+  FILE* source = fopen("test_data.txt", "r");
   FILE* dest = fopen("compressed.txt", "w");
   release_assert(source && dest,
                  "could not open test_data.txt / compressed.txt");
